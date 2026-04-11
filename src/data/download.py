@@ -61,17 +61,47 @@ def download_cboe_put_call_ratio(data_dir=None):
 
     Returns
     -------
-    pd.Series
-        Put/call ratio indexed by date.
+    pd.DataFrame
+        Put/call ratio data.
     """
     data_dir = data_dir or os.path.abspath(DATA_DIR)
     os.makedirs(data_dir, exist_ok=True)
     path = os.path.join(data_dir, "put_call_ratio.csv")
 
-    print(f"Downloading CBOE Total Put/Call Ratio...")
+    print("Downloading CBOE Total Put/Call Ratio...")
     urllib.request.urlretrieve(CBOE_TOTALPC_URL, path)
 
-    df = pd.read_csv(path)
+    # CBOE CSV has disclaimer rows before actual data — find the header row
+    with open(path, "r") as f:
+        lines = f.readlines()
+
+    header_idx = None
+    for i, line in enumerate(lines):
+        if "DATE" in line.upper() and ("P/C" in line.upper() or "RATIO" in line.upper()):
+            header_idx = i
+            break
+        if "TRADE DATE" in line.upper():
+            header_idx = i
+            break
+
+    if header_idx is not None:
+        df = pd.read_csv(path, skiprows=header_idx)
+    else:
+        # Try skipping rows until we find numeric data
+        for skip in range(10):
+            try:
+                df = pd.read_csv(path, skiprows=skip)
+                # Check if first column looks like dates
+                first_col = df.columns[0]
+                pd.to_datetime(df[first_col].iloc[0])
+                break
+            except (ValueError, TypeError):
+                continue
+        else:
+            df = pd.read_csv(path)
+
+    # Clean up column names
+    df.columns = [c.strip() for c in df.columns]
     print(f"  -> {len(df)} rows saved to {path}")
     print(f"  Columns: {list(df.columns)}")
     return df
@@ -98,8 +128,8 @@ def download_fred(start="2010-01-01", end="2024-01-01", api_key=None, data_dir=N
         api_key = os.environ.get("FRED_API_KEY")
 
     if api_key is None:
-        print("WARNING: No FRED API key found. Attempting CSV fallback...")
-        return _fred_fallback(data_dir)
+        print("WARNING: No FRED API key found. Attempting yfinance fallback...")
+        return _fred_fallback(data_dir, start=start, end=end)
 
     from fredapi import Fred
     fred = Fred(api_key=api_key)
@@ -122,16 +152,34 @@ def download_fred(start="2010-01-01", end="2024-01-01", api_key=None, data_dir=N
     return df
 
 
-def _fred_fallback(data_dir):
-    """Try loading treasury data from existing CSV if FRED API key unavailable."""
+def _fred_fallback(data_dir, start="2010-01-01", end="2024-01-01"):
+    """Try loading treasury data from existing CSV, or download from yfinance."""
     path = os.path.join(data_dir, "treasury.csv")
     if os.path.exists(path):
         print(f"  Loading from existing {path}")
         return pd.read_csv(path, index_col=0, parse_dates=True)
-    raise FileNotFoundError(
-        "No FRED API key and no treasury.csv found. "
-        "Set FRED_API_KEY env var or place treasury.csv in data/raw/."
-    )
+
+    # yfinance fallback: ^TNX (10y yield), ^IRX (13-week bill yield as 2y proxy)
+    print("  Downloading treasury yields from yfinance (^TNX, ^IRX)...")
+    tnx = yf.download("^TNX", start=start, end=end, auto_adjust=True, progress=False)
+    irx = yf.download("^IRX", start=start, end=end, auto_adjust=True, progress=False)
+
+    if isinstance(tnx.columns, pd.MultiIndex):
+        tnx.columns = tnx.columns.droplevel(1)
+    if isinstance(irx.columns, pd.MultiIndex):
+        irx.columns = irx.columns.droplevel(1)
+
+    # These indices report yields in percentage points; convert to decimal
+    df = pd.DataFrame({
+        "treasury_2y": irx["Close"] / 100.0,
+        "treasury_10y": tnx["Close"] / 100.0,
+    })
+    df.index.name = "Date"
+    df = df.dropna()
+
+    df.to_csv(path)
+    print(f"  -> {len(df)} rows saved to {path}")
+    return df
 
 
 def load_cboe_files(data_dir=None):
