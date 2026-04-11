@@ -249,14 +249,16 @@ def preprocess_options(opts_df, master_df, scaler, seq_len=SEQ_LEN):
 
     Returns
     -------
-    pd.DataFrame
-        Filtered options with columns: sequence, strike, time_to_expiry,
-        rate_input, moneyness_input, vol_regime, mid_price (label).
+    (pd.DataFrame, np.ndarray)
+        opts_df: Filtered options with columns: seq_idx, strike, time_to_expiry,
+            rate_input, moneyness_input, vol_regime_input, mid_price (label).
+        sequences: Array of shape (n_unique_dates, seq_len, 20). Each option's
+            seq_idx column indexes into this array.
     """
     opts = opts_df.copy()
 
-    # Standardize column names
-    opts.columns = [c.lower().strip().replace(" ", "_") for c in opts.columns]
+    # Standardize column names: lowercase, strip whitespace and brackets
+    opts.columns = [c.lower().strip().replace(" ", "_").strip("[]") for c in opts.columns]
 
     # Map alternative column names to expected names
     col_aliases = {
@@ -264,12 +266,12 @@ def preprocess_options(opts_df, master_df, scaler, seq_len=SEQ_LEN):
         "expiration": ["expiration", "expire_date", "expiry", "expiration_date"],
         "strike": ["strike", "strike_price"],
         "option_type": ["option_type", "type", "cp_flag", "call_put", "right"],
-        "bid": ["bid", "best_bid", "bid_price"],
-        "ask": ["ask", "best_offer", "ask_price", "offer"],
+        "bid": ["bid", "best_bid", "bid_price", "c_bid"],
+        "ask": ["ask", "best_offer", "ask_price", "offer", "c_ask"],
         "mid_price": ["mid_price", "mid", "price"],
         "underlying_price": ["underlying_price", "underlying_last", "stock_price",
                              "spot_price", "close", "underlying_close"],
-        "implied_volatility": ["implied_volatility", "iv", "impl_volatility"],
+        "implied_volatility": ["implied_volatility", "iv", "impl_volatility", "c_iv"],
     }
 
     for target, candidates in col_aliases.items():
@@ -284,7 +286,9 @@ def preprocess_options(opts_df, master_df, scaler, seq_len=SEQ_LEN):
         if col in opts.columns:
             opts[col] = pd.to_datetime(opts[col])
 
-    # Keep calls only
+    # Keep calls only — if option_type column exists, filter.
+    # Kaggle SPY EOD format has C_/P_ columns per row (no option_type column),
+    # so bid/ask already map to call columns via aliases above.
     if "option_type" in opts.columns:
         type_vals = opts["option_type"].astype(str).str.upper().str.strip()
         opts = opts[type_vals.isin(["C", "CALL"])].copy()
@@ -301,66 +305,53 @@ def preprocess_options(opts_df, master_df, scaler, seq_len=SEQ_LEN):
     opts = opts[opts["mid_price"] > 0.05].copy()
 
     # Scale the master features
-    master_scaled = pd.DataFrame(
-        scaler.transform(master_df[FEATURE_COLS].values),
-        index=master_df.index,
-        columns=FEATURE_COLS,
-    )
+    master_scaled_values = scaler.transform(master_df[FEATURE_COLS].values)
 
-    # Attach sequences and t-1 values
-    sequences = []
-    moneyness_inputs = []
-    rate_inputs = []
-    vol_regimes = []
-    valid_mask = []
-
+    # Build per-date sequences (vectorized — ~3500 unique dates vs millions of rows)
     trading_days = master_df.index
     date_to_iloc = {d: i for i, d in enumerate(trading_days)}
 
-    for _, row in opts.iterrows():
-        contract_date = row["date"]
-        if contract_date not in date_to_iloc:
-            # Find nearest prior trading day
-            mask = trading_days <= contract_date
+    date_seq_list = []        # list of (60, 20) arrays
+    date_to_seq_idx = {}      # date -> index into date_seq_list
+    date_spy_close = {}
+    date_rate = {}
+    date_vol_regime = {}
+
+    for d in opts["date"].unique():
+        d_ts = pd.Timestamp(d)
+        if d_ts not in date_to_iloc:
+            mask = trading_days <= d_ts
             if mask.sum() == 0:
-                valid_mask.append(False)
-                sequences.append(None)
-                moneyness_inputs.append(np.nan)
-                rate_inputs.append(np.nan)
-                vol_regimes.append(np.nan)
                 continue
-            contract_date = trading_days[mask][-1]
+            d_ts = trading_days[mask][-1]
 
-        idx = date_to_iloc[contract_date]
-
+        idx = date_to_iloc[d_ts]
         if idx < seq_len:
-            valid_mask.append(False)
-            sequences.append(None)
-            moneyness_inputs.append(np.nan)
-            rate_inputs.append(np.nan)
-            vol_regimes.append(np.nan)
             continue
 
-        # Sequence ends at t-1 (no lookahead)
-        seq = master_scaled.iloc[idx - seq_len: idx].values
-        sequences.append(seq)
-
-        # t-1 values for contract features
+        date_to_seq_idx[d] = len(date_seq_list)
+        date_seq_list.append(master_scaled_values[idx - seq_len: idx].astype(np.float32))
         t_minus_1 = master_df.iloc[idx - 1]
-        moneyness_inputs.append(t_minus_1["spy_close"] / row["strike"])
-        rate_inputs.append(t_minus_1["treasury_2y"])
-        vol_regimes.append(t_minus_1.get("vol_regime", 1))
-        valid_mask.append(True)
+        date_spy_close[d] = t_minus_1["spy_close"]
+        date_rate[d] = t_minus_1["treasury_2y"]
+        date_vol_regime[d] = t_minus_1.get("vol_regime", 1)
 
-    opts["sequence"] = sequences
-    opts["moneyness_input"] = moneyness_inputs
-    opts["rate_input"] = rate_inputs
-    opts["vol_regime_input"] = vol_regimes
-    opts["valid"] = valid_mask
+    # Stack into a single array: (n_unique_dates, seq_len, 20)
+    sequences_array = np.stack(date_seq_list) if date_seq_list else np.empty((0, seq_len, len(FEATURE_COLS)), dtype=np.float32)
 
-    opts = opts[opts["valid"]].drop(columns=["valid"]).reset_index(drop=True)
+    # Keep only options with valid dates
+    valid_dates = set(date_to_seq_idx.keys())
+    opts = opts[opts["date"].isin(valid_dates)].copy()
 
-    return opts
+    # Store integer index into sequences_array (not the array itself)
+    opts["seq_idx"] = opts["date"].map(date_to_seq_idx).astype(int)
+    opts["moneyness_input"] = opts["date"].map(date_spy_close) / opts["strike"]
+    opts["rate_input"] = opts["date"].map(date_rate)
+    opts["vol_regime_input"] = opts["date"].map(date_vol_regime)
+
+    opts = opts.reset_index(drop=True)
+
+    return opts, sequences_array
 
 
 def split_options(opts, cutoff="2020-01-01"):
@@ -437,19 +428,21 @@ def run_full_pipeline(raw_dir=None, processed_dir=None):
 
     # Options preprocessing (if options data exists)
     opts_found = False
-    for fname in ["spy_options.csv", "spy_options_data.csv", "sp500_options.csv", "options.csv"]:
-        path = os.path.join(raw_dir, fname)
-        if os.path.exists(path):
-            print(f"Preprocessing options data from {fname}...")
-            opts_raw = pd.read_csv(path, parse_dates=["date", "expiration"])
-            opts = preprocess_options(opts_raw, master, scaler)
-            opts_train, opts_test = split_options(opts)
-            print(f"  Options train: {len(opts_train)}, test: {len(opts_test)}")
+    from src.data.download import load_options_data
+    try:
+        opts_raw = load_options_data(raw_dir)
+        print(f"Preprocessing options data ({len(opts_raw)} rows)...")
+        opts, sequences_arr = preprocess_options(opts_raw, master, scaler)
+        opts_train, opts_test = split_options(opts)
+        print(f"  Options train: {len(opts_train)}, test: {len(opts_test)}")
+        print(f"  Unique-date sequences: {sequences_arr.shape}")
 
-            opts_train.to_pickle(os.path.join(processed_dir, "opts_train.pkl"))
-            opts_test.to_pickle(os.path.join(processed_dir, "opts_test.pkl"))
-            opts_found = True
-            break
+        opts_train.to_pickle(os.path.join(processed_dir, "opts_train.pkl"))
+        opts_test.to_pickle(os.path.join(processed_dir, "opts_test.pkl"))
+        np.save(os.path.join(processed_dir, "opts_sequences.npy"), sequences_arr)
+        opts_found = True
+    except FileNotFoundError:
+        pass
 
     if not opts_found:
         print("WARNING: No options CSV found. Skipping options preprocessing.")

@@ -202,6 +202,24 @@ def load_cboe_files(data_dir=None):
     return result
 
 
+def _normalize_options_columns(df):
+    """Strip brackets, lowercase, and normalize column names from various Kaggle formats."""
+    # Strip brackets and whitespace, lowercase
+    df.columns = [c.strip().lower().strip("[]") for c in df.columns]
+
+    # Parse date columns
+    for dcol in ["date", "quote_date", "trade_date", "data_date"]:
+        if dcol in df.columns:
+            df["date"] = pd.to_datetime(df[dcol])
+            break
+    for dcol in ["expiration", "expire_date", "expiry", "expiration_date"]:
+        if dcol in df.columns:
+            df["expiration"] = pd.to_datetime(df[dcol])
+            break
+
+    return df
+
+
 def load_options_data(data_dir=None):
     """
     Load the Kaggle SPY options dataset.
@@ -223,19 +241,17 @@ def load_options_data(data_dir=None):
             print(f"Loading options data from {path}...")
             # Try to detect date columns
             df = pd.read_csv(path, low_memory=False)
-            # Normalize column names to lowercase
-            df.columns = [c.strip().lower() for c in df.columns]
+            df = _normalize_options_columns(df)
+            print(f"  -> {len(df)} rows, columns: {list(df.columns)[:10]}...")
+            return df
 
-            # Parse date columns
-            for dcol in ["date", "quote_date", "trade_date", "data_date"]:
-                if dcol in df.columns:
-                    df["date"] = pd.to_datetime(df[dcol])
-                    break
-            for dcol in ["expiration", "expire_date", "expiry", "expiration_date"]:
-                if dcol in df.columns:
-                    df["expiration"] = pd.to_datetime(df[dcol])
-                    break
-
+    # Also check for any CSV with "option" in the name
+    for fname in sorted(os.listdir(data_dir)):
+        if fname.endswith(".csv") and "option" in fname.lower():
+            path = os.path.join(data_dir, fname)
+            print(f"Found options CSV by name: {path}")
+            df = pd.read_csv(path, low_memory=False)
+            df = _normalize_options_columns(df)
             print(f"  -> {len(df)} rows, columns: {list(df.columns)[:10]}...")
             return df
 
@@ -248,15 +264,7 @@ def load_options_data(data_dir=None):
                     path = os.path.join(subpath, fname)
                     print(f"Found CSV in subdirectory: {path}")
                     df = pd.read_csv(path, low_memory=False)
-                    df.columns = [c.strip().lower() for c in df.columns]
-                    for dcol in ["date", "quote_date", "trade_date"]:
-                        if dcol in df.columns:
-                            df["date"] = pd.to_datetime(df[dcol])
-                            break
-                    for dcol in ["expiration", "expire_date", "expiry", "expiration_date"]:
-                        if dcol in df.columns:
-                            df["expiration"] = pd.to_datetime(df[dcol])
-                            break
+                    df = _normalize_options_columns(df)
                     print(f"  -> {len(df)} rows")
                     return df
 

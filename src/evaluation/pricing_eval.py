@@ -62,17 +62,25 @@ def assign_expiry_bucket(tte_days):
 # Inference helpers
 # ---------------------------------------------------------------------------
 
-def predict_transformer(model, opts_df, batch_size=512, device=None):
+def predict_transformer(model, opts_df, sequences=None, batch_size=512, device=None):
     """
     Run inference on preprocessed options DataFrame using a Transformer.
+
+    Parameters
+    ----------
+    sequences : np.ndarray or None
+        Shape (n_unique_dates, seq_len, 20). Required — each option's seq_idx
+        column indexes into this array.
 
     Returns np.array of predictions aligned with opts_df rows.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else
                               "mps" if torch.backends.mps.is_available() else "cpu")
+    if sequences is None:
+        raise ValueError("sequences array is required for predict_transformer")
 
-    dataset = OptionsDataset(opts_df)
+    dataset = OptionsDataset(opts_df, sequences)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     model = model.to(device).eval()
@@ -84,6 +92,35 @@ def predict_transformer(model, opts_df, batch_size=512, device=None):
             preds.append(out.cpu().numpy())
 
     return np.concatenate(preds, axis=0).flatten()
+
+
+def modify_sequences_for_ablation(sequences, ablation_id):
+    """
+    Modify sequences array for a specific ablation study.
+
+    Returns a new sequences array with the appropriate feature/length changes.
+    """
+    if ablation_id == "A1":
+        # Remove vix_slope (col 6) and vix_6m_slope (col 7)
+        return np.delete(sequences, [6, 7], axis=2)
+    elif ablation_id == "A2":
+        # Remove credit_spread (14), treasury_2y (16), put_call_ratio (17), dxy (18)
+        return np.delete(sequences, [14, 16, 17, 18], axis=2)
+    elif ablation_id == "A3":
+        # Shorter context: last 20 steps of each 60-step sequence
+        return sequences[:, -20:, :]
+    elif ablation_id == "A4":
+        # Longer context: zero-pad to 120 steps
+        pad_len = 120 - sequences.shape[1]
+        return np.pad(sequences, ((0, 0), (pad_len, 0), (0, 0)), mode="constant")
+    elif ablation_id == "A5":
+        # Same input, different model depth
+        return sequences
+    elif ablation_id == "A6":
+        # Remove vol_regime (col 19)
+        return np.delete(sequences, [19], axis=2)
+    else:
+        raise ValueError(f"Unknown ablation ID: {ablation_id}")
 
 
 def predict_black_scholes(opts_df, master_df=None):
@@ -139,8 +176,8 @@ def predict_black_scholes(opts_df, master_df=None):
 # Full evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_all_models(opts_test, models_dict, master_df=None, device=None,
-                        figures_dir=None, tables_dir=None):
+def evaluate_all_models(opts_test, models_dict, sequences=None, master_df=None,
+                        device=None, figures_dir=None, tables_dir=None):
     """
     Evaluate all models on the test options set.
 
@@ -150,6 +187,8 @@ def evaluate_all_models(opts_test, models_dict, master_df=None, device=None,
         Preprocessed test options.
     models_dict : dict
         {name: model} where model is a TransformerPricingNetwork or "BS" for Black-Scholes.
+    sequences : np.ndarray
+        Shape (n_unique_dates, seq_len, 20). Required for Transformer models.
     master_df : pd.DataFrame or None
         Needed for BS rv_21d lookup.
     device : torch.device or None
@@ -176,7 +215,7 @@ def evaluate_all_models(opts_test, models_dict, master_df=None, device=None,
         if name.lower() == "black-scholes" or model == "BS":
             predictions[name] = predict_black_scholes(opts_test, master_df)
         else:
-            predictions[name] = predict_transformer(model, opts_test, device=device)
+            predictions[name] = predict_transformer(model, opts_test, sequences=sequences, device=device)
 
     # ── Overall metrics ──
     overall_rows = []
@@ -282,8 +321,8 @@ def _plot_comparison(overall_df, figures_dir):
     plt.show()
 
 
-def evaluate_ablations(opts_test, ablation_models, baseline_model, master_df=None,
-                       device=None, tables_dir=None):
+def evaluate_ablations(opts_test, ablation_models, baseline_model, sequences=None,
+                       master_df=None, device=None, tables_dir=None):
     """
     Evaluate ablation models vs baseline and report a results table.
 
@@ -294,6 +333,8 @@ def evaluate_ablations(opts_test, ablation_models, baseline_model, master_df=Non
         {ablation_id: model}
     baseline_model : TransformerPricingNetwork
         Experiment C baseline.
+    sequences : np.ndarray
+        Shape (n_unique_dates, seq_len, 20). Required for Transformer models.
     master_df : pd.DataFrame or None
     device : torch.device or None
     tables_dir : str or None
@@ -309,13 +350,14 @@ def evaluate_ablations(opts_test, ablation_models, baseline_model, master_df=Non
     y_true = opts_test["mid_price"].values
 
     # Baseline predictions
-    baseline_preds = predict_transformer(baseline_model, opts_test, device=device)
+    baseline_preds = predict_transformer(baseline_model, opts_test,
+                                         sequences=sequences, device=device)
     baseline_metrics = compute_metrics(y_true, baseline_preds)
 
     rows = [{"Ablation": "Baseline (C)", **baseline_metrics}]
 
     for abl_id, model in ablation_models.items():
-        preds = predict_transformer(model, opts_test, device=device)
+        preds = predict_transformer(model, opts_test, sequences=sequences, device=device)
         m = compute_metrics(y_true, preds)
         m["Ablation"] = abl_id
         m["MAE_diff"] = m["MAE"] - baseline_metrics["MAE"]

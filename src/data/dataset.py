@@ -119,36 +119,43 @@ class OptionsDataset(Dataset):
     """
     Dataset wrapping preprocessed options DataFrame for evaluation or fine-tuning.
 
-    Reads from the preprocessed DataFrame with 'sequence', contract features, and labels.
+    Uses seq_idx to look up sequences from a shared array (memory-efficient).
     """
 
-    def __init__(self, opts_df):
+    def __init__(self, opts_df, sequences):
         """
         Parameters
         ----------
         opts_df : pd.DataFrame
-            Must have columns: sequence, strike, time_to_expiry,
+            Must have columns: seq_idx, strike, time_to_expiry,
             rate_input, moneyness_input, mid_price.
+        sequences : np.ndarray, shape (n_unique_dates, seq_len, 20)
+            Shared sequence pool. Each option's seq_idx indexes into this.
         """
-        self.opts = opts_df.reset_index(drop=True)
+        self.strikes = opts_df["strike"].values.astype(np.float32)
+        self.tte = opts_df["time_to_expiry"].values.astype(np.float32)
+        self.rates = opts_df["rate_input"].values.astype(np.float32)
+        self.moneyness = opts_df["moneyness_input"].values.astype(np.float32)
+        self.labels = opts_df["mid_price"].values.astype(np.float32)
+        self.seq_idx = opts_df["seq_idx"].values.astype(np.int64)
+        self.sequences = sequences  # shared, not copied
 
     def __len__(self):
-        return len(self.opts)
+        return len(self.labels)
 
     def __getitem__(self, idx):
-        row = self.opts.iloc[idx]
-        seq = np.array(row["sequence"], dtype=np.float32)
+        seq = self.sequences[self.seq_idx[idx]]  # (seq_len, 20)
         seq_len = seq.shape[0]
 
         contract = np.array([
-            row["strike"],
-            row["time_to_expiry"],
-            row["rate_input"],
-            row["moneyness_input"],
+            self.strikes[idx],
+            self.tte[idx],
+            self.rates[idx],
+            self.moneyness[idx],
         ], dtype=np.float32)
         contract_tiled = np.tile(contract, (seq_len, 1))
 
         full_input = np.concatenate([seq, contract_tiled], axis=-1)
-        label = np.array([row["mid_price"]], dtype=np.float32)
+        label = np.array([self.labels[idx]], dtype=np.float32)
 
         return torch.tensor(full_input), torch.tensor(label)
