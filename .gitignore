@@ -1,6 +1,8 @@
 # Data (too large / not ours to redistribute)
 data/raw/
 data/processed/
+*.csv
+Options*.csv
 
 # Model checkpoints
 checkpoints/
