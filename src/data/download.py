@@ -221,10 +221,22 @@ def load_cboe_files(data_dir=None):
         print(f"WARNING: {pcr_path} not found. Run download_cboe_put_call_ratio() first.")
         result["put_call_ratio"] = None
     else:
-        df = pd.read_csv(pcr_path)
-        # CBOE totalpc.csv columns: DATE, CALLS, PUTS, TOTAL, P/C Ratio
+        # CBOE CSV may have disclaimer rows before the actual header
+        df = None
+        with open(pcr_path, "r") as f:
+            lines = f.readlines()
+        for skip in range(min(20, len(lines))):
+            line_upper = lines[skip].upper()
+            if "DATE" in line_upper and ("P/C" in line_upper or "CALL" in line_upper):
+                df = pd.read_csv(pcr_path, skiprows=skip)
+                df.columns = [c.strip() for c in df.columns]
+                break
+        if df is None:
+            df = pd.read_csv(pcr_path)
+
+        # Find date and ratio columns
         date_col = None
-        for candidate in ["DATE", "Date", "date", "Trade Date"]:
+        for candidate in ["DATE", "Date", "date", "Trade Date", "TRADE DATE"]:
             if candidate in df.columns:
                 date_col = candidate
                 break

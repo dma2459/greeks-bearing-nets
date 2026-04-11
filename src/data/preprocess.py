@@ -183,7 +183,11 @@ def build_master_dataframe(spy, vix, vvix, hyg, lqd, dxy, treasury, cboe):
 # ---------------------------------------------------------------------------
 
 def clean_and_split(master, train_end="2019-12-31", test_start="2020-01-01"):
-    """Drop NaN rows and perform temporal train/test split."""
+    """Forward-fill remaining NaN, drop any rows still incomplete, and split."""
+    # Forward-fill features that may have gaps (e.g. put_call_ratio ends 2019)
+    master[FEATURE_COLS] = master[FEATURE_COLS].ffill()
+    # Back-fill early rows that have NaN from rolling window warm-up
+    master[FEATURE_COLS] = master[FEATURE_COLS].bfill()
     master = master.dropna(subset=FEATURE_COLS)
     train_df = master.loc[:train_end].copy()
     test_df = master.loc[test_start:].copy()
