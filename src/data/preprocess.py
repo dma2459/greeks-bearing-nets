@@ -256,7 +256,28 @@ def preprocess_options(opts_df, master_df, scaler, seq_len=SEQ_LEN):
     opts = opts_df.copy()
 
     # Standardize column names
-    opts.columns = [c.lower().strip() for c in opts.columns]
+    opts.columns = [c.lower().strip().replace(" ", "_") for c in opts.columns]
+
+    # Map alternative column names to expected names
+    col_aliases = {
+        "date": ["date", "quote_date", "trade_date", "data_date"],
+        "expiration": ["expiration", "expire_date", "expiry", "expiration_date"],
+        "strike": ["strike", "strike_price"],
+        "option_type": ["option_type", "type", "cp_flag", "call_put", "right"],
+        "bid": ["bid", "best_bid", "bid_price"],
+        "ask": ["ask", "best_offer", "ask_price", "offer"],
+        "mid_price": ["mid_price", "mid", "price"],
+        "underlying_price": ["underlying_price", "underlying_last", "stock_price",
+                             "spot_price", "close", "underlying_close"],
+        "implied_volatility": ["implied_volatility", "iv", "impl_volatility"],
+    }
+
+    for target, candidates in col_aliases.items():
+        if target not in opts.columns:
+            for alias in candidates:
+                if alias in opts.columns:
+                    opts.rename(columns={alias: target}, inplace=True)
+                    break
 
     # Ensure date parsing
     for col in ["date", "expiration"]:
@@ -265,9 +286,8 @@ def preprocess_options(opts_df, master_df, scaler, seq_len=SEQ_LEN):
 
     # Keep calls only
     if "option_type" in opts.columns:
-        opts = opts[opts["option_type"].str.upper() == "C"].copy()
-    elif "type" in opts.columns:
-        opts = opts[opts["type"].str.upper() == "C"].copy()
+        type_vals = opts["option_type"].astype(str).str.upper().str.strip()
+        opts = opts[type_vals.isin(["C", "CALL"])].copy()
 
     # Compute derived features
     opts["time_to_expiry"] = (opts["expiration"] - opts["date"]).dt.days / 365.0
