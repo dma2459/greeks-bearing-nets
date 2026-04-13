@@ -97,7 +97,7 @@ def train_transformer(
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=lr_factor, patience=lr_patience, verbose=True,
+        optimizer, mode="min", factor=lr_factor, patience=lr_patience,
     )
     criterion = nn.MSELoss()
 
