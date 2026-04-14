@@ -27,6 +27,9 @@ def train_timegan(
     phase2_epochs=200,
     phase3_epochs=500,
     lr=1e-3,
+    lr_d=None,
+    lr_g=None,
+    g_steps_per_d=2,
     device=None,
     checkpoint_dir=None,
     log_every=10,
@@ -76,7 +79,14 @@ def train_timegan(
 
     # Loss functions
     mse = nn.MSELoss()
-    bce = nn.BCELoss()
+    # Use logit-based BCE — pairs with the Discriminator's new linear output.
+    bce = nn.BCEWithLogitsLoss()
+
+    # GANs train more stably with Adam(β1=0.5) and, usually, a lower D LR.
+    if lr_g is None:
+        lr_g = lr
+    if lr_d is None:
+        lr_d = lr * 0.5
 
     history = {"phase1_loss": [], "phase2_loss": [],
                "phase3_d_loss": [], "phase3_g_loss": []}
@@ -88,7 +98,7 @@ def train_timegan(
 
     opt_ae = torch.optim.Adam(
         list(model.embedder.parameters()) + list(model.recovery.parameters()),
-        lr=lr,
+        lr=lr, betas=(0.9, 0.999),
     )
 
     for epoch in range(1, phase1_epochs + 1):
@@ -147,13 +157,19 @@ def train_timegan(
     print("Phase 3: Joint Adversarial Training")
     print("=" * 60)
 
-    opt_d = torch.optim.Adam(model.discriminator.parameters(), lr=lr)
+    opt_d = torch.optim.Adam(model.discriminator.parameters(), lr=lr_d,
+                              betas=(0.5, 0.999))
+    # Generator step: only G + Supervisor (not E, R — those are updated
+    # separately by a reconstruction step to keep the AE anchored).
     opt_g = torch.optim.Adam(
         list(model.generator.parameters())
-        + list(model.supervisor.parameters())
-        + list(model.embedder.parameters())
-        + list(model.recovery.parameters()),
-        lr=lr,
+        + list(model.supervisor.parameters()),
+        lr=lr_g, betas=(0.5, 0.999),
+    )
+    # Embedder/Recovery stay anchored on reconstruction throughout Phase 3.
+    opt_er = torch.optim.Adam(
+        list(model.embedder.parameters()) + list(model.recovery.parameters()),
+        lr=lr_g, betas=(0.5, 0.999),
     )
 
     seq_len = train_sequences.shape[1]
@@ -171,44 +187,54 @@ def train_timegan(
             z = torch.randn(bs, seq_len, input_dim, device=device)
             h_fake = model.generator(z)
 
-            y_real = model.discriminator(h_real.detach())
-            y_fake = model.discriminator(h_fake.detach())
+            logit_real = model.discriminator(h_real.detach())
+            logit_fake = model.discriminator(h_fake.detach())
 
-            d_loss = bce(y_real, torch.ones_like(y_real)) + bce(y_fake, torch.zeros_like(y_fake))
+            d_loss = (bce(logit_real, torch.ones_like(logit_real))
+                      + bce(logit_fake, torch.zeros_like(logit_fake)))
 
             opt_d.zero_grad()
             d_loss.backward()
             opt_d.step()
             d_epoch_loss += d_loss.item()
 
-            # --- Generator update ---
-            z = torch.randn(bs, seq_len, input_dim, device=device)
-            h_fake = model.generator(z)
-            x_fake = model.recovery(h_fake)
-            h_sup = model.supervisor(h_fake)
-            y_fake = model.discriminator(h_fake)
+            # --- Generator updates (run more frequently than D) ---
+            for _ in range(g_steps_per_d):
+                z = torch.randn(bs, seq_len, input_dim, device=device)
+                h_fake = model.generator(z)
+                h_sup = model.supervisor(h_fake)
+                logit_fake = model.discriminator(h_fake)
 
-            # Adversarial loss: fool discriminator
-            g_loss_adv = bce(y_fake, torch.ones_like(y_fake))
+                # Adversarial loss: fool discriminator
+                g_loss_adv = bce(logit_fake, torch.ones_like(logit_fake))
+                # Supervisor loss: temporal consistency
+                g_loss_sup = mse(h_fake[:, 1:, :], h_sup[:, :-1, :])
 
-            # Supervisor loss: temporal consistency
-            g_loss_sup = mse(h_fake[:, 1:, :], h_sup[:, :-1, :])
+                # Moment matching on recovered (data-space) sequences. Only
+                # meaningful now that Recovery can span the real data range.
+                x_fake = model.recovery(h_fake)
+                g_loss_moments = (
+                    mse(x_fake.mean(dim=0), batch.mean(dim=0))
+                    + mse(x_fake.var(dim=0), batch.var(dim=0))
+                )
 
-            # Moment matching loss
-            g_loss_moments = (
-                mse(x_fake.mean(dim=0), batch.mean(dim=0))
-                + mse(x_fake.var(dim=0), batch.var(dim=0))
-            )
+                g_loss = g_loss_adv + 10.0 * g_loss_sup + g_loss_moments
 
-            g_loss = g_loss_adv + 10.0 * g_loss_sup + g_loss_moments
+                opt_g.zero_grad()
+                g_loss.backward()
+                opt_g.step()
+                g_epoch_loss += g_loss.item()
 
-            opt_g.zero_grad()
-            g_loss.backward()
-            opt_g.step()
-            g_epoch_loss += g_loss.item()
+            # --- Embedder/Recovery reconstruction anchor ---
+            h_real = model.embedder(batch)
+            x_hat = model.recovery(h_real)
+            ae_loss = mse(x_hat, batch)
+            opt_er.zero_grad()
+            ae_loss.backward()
+            opt_er.step()
 
         avg_d = d_epoch_loss / len(loader)
-        avg_g = g_epoch_loss / len(loader)
+        avg_g = g_epoch_loss / (len(loader) * g_steps_per_d)
         history["phase3_d_loss"].append(avg_d)
         history["phase3_g_loss"].append(avg_g)
 

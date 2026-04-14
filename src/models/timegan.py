@@ -36,13 +36,20 @@ class Embedder(nn.Module):
 
 
 class Recovery(nn.Module):
-    """Decode latent representations back to feature space."""
+    """
+    Decode latent representations back to feature space.
+
+    NOTE: No output nonlinearity. The training data is StandardScaler-scaled
+    (≈ zero mean, unit variance, range [-7, 5]) — a sigmoid output here would
+    crush everything into [0, 1] and cause the synthetic log returns to always
+    be positive. That was the root cause of the 4x inflated GAN labels in the
+    first run (mean $63 vs. real mean $16).
+    """
 
     def __init__(self, hidden_dim=64, output_dim=20):
         super().__init__()
         self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
         self.fc = nn.Linear(hidden_dim, output_dim)
-        self.sigmoid = nn.Sigmoid()
 
     def forward(self, h):
         """
@@ -55,7 +62,7 @@ class Recovery(nn.Module):
         x_hat : Tensor, shape (batch, seq_len, output_dim)
         """
         o, _ = self.gru(h)
-        x_hat = self.sigmoid(self.fc(o))
+        x_hat = self.fc(o)
         return x_hat
 
 
@@ -111,16 +118,21 @@ class Generator(nn.Module):
 
 
 class Discriminator(nn.Module):
-    """Classify sequences as real or fake."""
+    """
+    Classify sequences as real or fake.
+
+    Outputs raw logits (no sigmoid) — use BCEWithLogitsLoss. The previous
+    Sigmoid + BCELoss combo was prone to saturation, which is why the Phase 3
+    curve showed D loss collapsing near zero while G loss ballooned to 6+.
+    """
 
     def __init__(self, hidden_dim=64):
         super().__init__()
         self.gru1 = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
         self.gru2 = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
         self.fc1 = nn.Linear(hidden_dim, 64)
-        self.relu = nn.ReLU()
+        self.leaky = nn.LeakyReLU(0.2)
         self.fc2 = nn.Linear(64, 1)
-        self.sigmoid = nn.Sigmoid()
 
     def forward(self, h):
         """
@@ -130,14 +142,14 @@ class Discriminator(nn.Module):
 
         Returns
         -------
-        y : Tensor, shape (batch, 1)
-            P(real).
+        logits : Tensor, shape (batch, 1)
+            Pre-sigmoid logit. Pair with BCEWithLogitsLoss.
         """
         o, _ = self.gru1(h)
         _, h_last = self.gru2(o)  # h_last: (1, batch, hidden_dim)
         h_last = h_last.squeeze(0)  # (batch, hidden_dim)
-        y = self.sigmoid(self.fc2(self.relu(self.fc1(h_last))))
-        return y
+        logits = self.fc2(self.leaky(self.fc1(h_last)))
+        return logits
 
 
 class TimeGAN(nn.Module):
