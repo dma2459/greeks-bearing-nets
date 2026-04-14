@@ -32,6 +32,7 @@ def train_transformer(
     checkpoint_dir=None,
     experiment_name="experiment",
     log_every=1,
+    log_target=True,
 ):
     """
     Train a Transformer pricing network with early stopping and LR scheduling.
@@ -58,6 +59,11 @@ def train_transformer(
     checkpoint_dir : str or None
     experiment_name : str
     log_every : int
+    log_target : bool
+        If True, train on log1p(price) instead of raw price. This gives equal
+        relative weight to cheap (OTM) and expensive (ITM) options and fixes
+        the severe OTM miscalibration seen in the first run. Model still
+        outputs log-price at inference; caller must apply expm1.
 
     Returns
     -------
@@ -95,11 +101,25 @@ def train_transformer(
     print(f"  Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
     model = model.to(device)
+
+    # If training in log-space, re-seed the head's bias near log(15) ≈ 2.7
+    # so the warm-start matches the transformed target range.
+    if log_target:
+        try:
+            last_linear = [m for m in model.head if isinstance(m, nn.Linear)][-1]
+            with torch.no_grad():
+                last_linear.bias.fill_(float(np.log1p(15.0)))
+        except Exception:
+            pass
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=lr_factor, patience=lr_patience,
     )
     criterion = nn.MSELoss()
+
+    def _transform_label(y):
+        return torch.log1p(torch.clamp(y, min=0.0)) if log_target else y
 
     history = {"train_loss": [], "val_loss": [], "lr": []}
     best_val_loss = float("inf")
@@ -113,7 +133,7 @@ def train_transformer(
         n_batches = 0
         for inputs, labels in train_loader:
             inputs = inputs.to(device)
-            labels = labels.to(device)
+            labels = _transform_label(labels.to(device))
 
             preds = model(inputs)
             loss = criterion(preds, labels)
@@ -135,7 +155,7 @@ def train_transformer(
         with torch.no_grad():
             for inputs, labels in val_loader:
                 inputs = inputs.to(device)
-                labels = labels.to(device)
+                labels = _transform_label(labels.to(device))
                 preds = model(inputs)
                 loss = criterion(preds, labels)
                 val_loss_sum += loss.item()
@@ -171,6 +191,9 @@ def train_transformer(
     if best_state is not None:
         model.load_state_dict(best_state)
     model = model.cpu()
+
+    # Tag the model so predict_transformer knows to apply expm1 at inference.
+    model.log_target = log_target
 
     # Save final
     torch.save(model.state_dict(), os.path.join(checkpoint_dir, "final_model.pt"))

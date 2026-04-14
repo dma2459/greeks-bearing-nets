@@ -91,7 +91,13 @@ def predict_transformer(model, opts_df, sequences=None, batch_size=512, device=N
             out = model(inputs)
             preds.append(out.cpu().numpy())
 
-    return np.concatenate(preds, axis=0).flatten()
+    raw = np.concatenate(preds, axis=0).flatten()
+    # Inverse of the log1p target transform used in train_transformer.
+    if getattr(model, "log_target", False):
+        raw = np.expm1(raw)
+    # Clamp to non-negative (the head no longer has a final ReLU — that was
+    # causing A3/A6 to collapse to the dead-ReLU "predict 0 always" minimum).
+    return np.maximum(raw, 0.0)
 
 
 def modify_sequences_for_ablation(sequences, ablation_id):

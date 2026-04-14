@@ -67,7 +67,7 @@ class TransformerPricingNetwork(nn.Module):
     Full Transformer pricing network.
 
     Input:  (batch, 60, 24)   20 market features + 4 contract params
-    Output: (batch, 1)        predicted option price (non-negative via ReLU)
+    Output: (batch, 1)        predicted option price (clamped non-negative at inference)
     """
 
     def __init__(self, input_dim=24, d_model=64, n_heads=4, d_ff=256,
@@ -86,7 +86,8 @@ class TransformerPricingNetwork(nn.Module):
             for _ in range(n_layers)
         ])
 
-        # Prediction head
+        # Prediction head — final softplus keeps prices non-negative without
+        # the dead-ReLU collapse that caused A3/A6 to output all zeros.
         self.head = nn.Sequential(
             nn.Linear(d_model, 64),
             nn.ReLU(),
@@ -94,8 +95,12 @@ class TransformerPricingNetwork(nn.Module):
             nn.Linear(64, 32),
             nn.ReLU(),
             nn.Linear(32, 1),
-            nn.ReLU(),  # Non-negative price
         )
+
+        # Warm-start the final bias near the mean option price so the network
+        # doesn't have to climb out of zero. 15 ~= mean(mid_price) on this data.
+        with torch.no_grad():
+            self.head[-1].bias.fill_(15.0)
 
     def forward(self, x):
         """
