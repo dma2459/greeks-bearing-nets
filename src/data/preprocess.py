@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
-# The 20 features used throughout the pipeline
+# The 20 features used throughout the pipeline (GAN trains on all 20)
 FEATURE_COLS = [
     "log_return", "rv_5d", "rv_21d", "rv_63d",
     "gk_vol", "vix", "vix_slope", "vix_6m_slope",
@@ -20,7 +20,93 @@ FEATURE_COLS = [
     "treasury_2y", "put_call_ratio", "dxy", "vol_regime",
 ]
 
-SEQ_LEN = 60  # trading days per sequence (~3 months)
+SEQ_LEN = 60  # trading days per sequence (~3 months) — used by GAN
+
+# Run 3 pricing-network config: drop the four macro features that ablation
+# A2 flagged as harmful noise (credit_spread idx 14, treasury_2y 16,
+# put_call_ratio 17, dxy 18), and shorten the context window to 30 days
+# (ablation A3 showed 60 was too long). The GAN still trains on all 20
+# features at seq_len=60 — these drops apply only at the Transformer stage.
+MACRO_DROP_INDICES = [14, 16, 17, 18]
+PRICING_SEQ_LEN = 30
+
+
+def prepare_pricing_sequences(sequences, drop_macros=True, seq_len=PRICING_SEQ_LEN):
+    """
+    Slice full (N, 60, 20) sequences down to the Transformer's input shape.
+
+    Parameters
+    ----------
+    sequences : np.ndarray, shape (N, src_seq_len, 20)
+        Real or GAN-synthesized market sequences.
+    drop_macros : bool
+        Drop the four macro features identified as noise by ablation A2.
+    seq_len : int
+        Context window length. Takes the *last* seq_len steps so the most
+        recent history (which is what the pricing model actually uses) is
+        preserved.
+
+    Returns
+    -------
+    np.ndarray, shape (N, seq_len, 20 - len(dropped))
+    """
+    out = sequences
+    if seq_len is not None and seq_len < out.shape[1]:
+        out = out[:, -seq_len:, :]
+    if drop_macros:
+        out = np.delete(out, MACRO_DROP_INDICES, axis=2)
+    return out
+
+
+# After MACRO_DROP_INDICES has been removed, the remaining 16 features are
+# reindexed. Positions in the reduced set we care about for A1/A6:
+#   original 6  vix_slope        → reduced 6   (unchanged, macros all come later)
+#   original 7  vix_6m_slope     → reduced 7
+#   original 15 volume_zscore    → reduced 14
+#   original 19 vol_regime       → reduced 15
+REDUCED_VIX_SLOPE_INDICES = [6, 7]
+REDUCED_VOL_REGIME_INDEX = 15
+
+
+def prepare_ablation_sequences(sequences, ablation_id):
+    """
+    Build the input sequences for a specific ablation study, starting from
+    the raw (N, 60, 20) arrays.
+
+    Each ablation is expressed as a delta from the Run 3 baseline
+    (drop_macros=True, seq_len=30). Model input_dim and seq_len for each
+    variant are produced by build_ablation_transformer in src/models/transformer.py.
+
+    Parameters
+    ----------
+    sequences : np.ndarray, shape (N, 60, 20)
+        Raw sequences with all 20 features and full 60-step context.
+    ablation_id : str
+        One of A1..A6.
+
+    Returns
+    -------
+    np.ndarray
+        Prepared sequences for that ablation.
+    """
+    if ablation_id == "A1":
+        # Drop VIX slope features on top of baseline
+        out = prepare_pricing_sequences(sequences)  # (N, 30, 16)
+        return np.delete(out, REDUCED_VIX_SLOPE_INDICES, axis=2)  # (N, 30, 14)
+    if ablation_id == "A2":
+        # Keep macros (compare to baseline which drops them)
+        return prepare_pricing_sequences(sequences, drop_macros=False)  # (N, 30, 20)
+    if ablation_id == "A3":
+        return prepare_pricing_sequences(sequences, seq_len=20)  # (N, 20, 16)
+    if ablation_id == "A4":
+        return prepare_pricing_sequences(sequences, seq_len=60)  # (N, 60, 16)
+    if ablation_id == "A5":
+        # A5 is a model-depth ablation; features/seq_len match baseline
+        return prepare_pricing_sequences(sequences)
+    if ablation_id == "A6":
+        out = prepare_pricing_sequences(sequences)  # (N, 30, 16)
+        return np.delete(out, [REDUCED_VOL_REGIME_INDEX], axis=2)  # (N, 30, 15)
+    raise ValueError(f"Unknown ablation ID: {ablation_id}")
 
 PROCESSED_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "processed")
 RAW_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "raw")

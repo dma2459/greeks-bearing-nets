@@ -32,7 +32,7 @@ def train_transformer(
     checkpoint_dir=None,
     experiment_name="experiment",
     log_every=1,
-    log_target=True,
+    target_mode="time_value",
 ):
     """
     Train a Transformer pricing network with early stopping and LR scheduling.
@@ -41,7 +41,9 @@ def train_transformer(
     ----------
     model : TransformerPricingNetwork
     train_dataset : Dataset
-        Must return (input, label) tuples.
+        Must return (input, label) tuples. Input tensor's last 4 features
+        along the channel dim must be the tiled contract params in the
+        order [strike, time_to_expiry, rate, moneyness].
     val_dataset : Dataset or None
         If None, split from train_dataset using val_split.
     val_split : float
@@ -59,11 +61,19 @@ def train_transformer(
     checkpoint_dir : str or None
     experiment_name : str
     log_every : int
-    log_target : bool
-        If True, train on log1p(price) instead of raw price. This gives equal
-        relative weight to cheap (OTM) and expensive (ITM) options and fixes
-        the severe OTM miscalibration seen in the first run. Model still
-        outputs log-price at inference; caller must apply expm1.
+    target_mode : str
+        One of "raw", "log", "time_value".
+
+        - "raw" : fit raw price directly. Overweights expensive ITM
+          options and starves OTM learning (Run 1 failure mode).
+        - "log" : fit log1p(price). Equalizes relative error across
+          moneyness but underweights ITM, pushing ATM/ITM error higher
+          (Run 2 failure mode — caused A to regress at ATM/ITM).
+        - "time_value" : fit log1p(price - max(S-K, 0)). The model only
+          learns the volatility premium; intrinsic value is computed
+          analytically at inference. This keeps ITM numerically tractable
+          because the network never has to reconstruct $50 of intrinsic
+          from features. Default for Run 3.
 
     Returns
     -------
@@ -72,6 +82,8 @@ def train_transformer(
     dict
         Training history.
     """
+    if target_mode not in ("raw", "log", "time_value"):
+        raise ValueError(f"target_mode must be raw|log|time_value, got {target_mode!r}")
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else
                               "mps" if torch.backends.mps.is_available() else "cpu")
@@ -102,15 +114,19 @@ def train_transformer(
 
     model = model.to(device)
 
-    # If training in log-space, re-seed the head's bias near log(15) ≈ 2.7
-    # so the warm-start matches the transformed target range.
-    if log_target:
-        try:
-            last_linear = [m for m in model.head if isinstance(m, nn.Linear)][-1]
-            with torch.no_grad():
-                last_linear.bias.fill_(float(np.log1p(15.0)))
-        except Exception:
-            pass
+    # Re-seed the head's final bias to match the transformed target range
+    # so the network isn't forced to climb out of zero.
+    #   raw        → ~$15 (mean option price)
+    #   log        → log1p(15) ≈ 2.77
+    #   time_value → log1p(4) ≈ 1.61 (mean time value is much smaller than
+    #                mean price because ITM options have tiny time value)
+    _bias_by_mode = {"raw": 15.0, "log": float(np.log1p(15.0)), "time_value": float(np.log1p(4.0))}
+    try:
+        last_linear = [m for m in model.head if isinstance(m, nn.Linear)][-1]
+        with torch.no_grad():
+            last_linear.bias.fill_(_bias_by_mode[target_mode])
+    except Exception:
+        pass
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -118,8 +134,22 @@ def train_transformer(
     )
     criterion = nn.MSELoss()
 
-    def _transform_label(y):
-        return torch.log1p(torch.clamp(y, min=0.0)) if log_target else y
+    def _transform_label(y, inputs):
+        """Transform raw-price labels to the training target space.
+
+        inputs carries contract params at channels [-4:]; we need strike
+        (channel -4) and moneyness = S/K (channel -1) to compute intrinsic.
+        """
+        if target_mode == "raw":
+            return y
+        if target_mode == "log":
+            return torch.log1p(torch.clamp(y, min=0.0))
+        # time_value — keep dims aligned with y (batch, 1) via slice notation
+        K = inputs[:, 0, -4:-3]
+        moneyness = inputs[:, 0, -1:]
+        intrinsic = torch.clamp((moneyness - 1.0) * K, min=0.0)
+        time_value = torch.clamp(y - intrinsic, min=0.0)
+        return torch.log1p(time_value)
 
     history = {"train_loss": [], "val_loss": [], "lr": []}
     best_val_loss = float("inf")
@@ -133,7 +163,7 @@ def train_transformer(
         n_batches = 0
         for inputs, labels in train_loader:
             inputs = inputs.to(device)
-            labels = _transform_label(labels.to(device))
+            labels = _transform_label(labels.to(device), inputs)
 
             preds = model(inputs)
             loss = criterion(preds, labels)
@@ -155,7 +185,7 @@ def train_transformer(
         with torch.no_grad():
             for inputs, labels in val_loader:
                 inputs = inputs.to(device)
-                labels = _transform_label(labels.to(device))
+                labels = _transform_label(labels.to(device), inputs)
                 preds = model(inputs)
                 loss = criterion(preds, labels)
                 val_loss_sum += loss.item()
@@ -192,8 +222,11 @@ def train_transformer(
         model.load_state_dict(best_state)
     model = model.cpu()
 
-    # Tag the model so predict_transformer knows to apply expm1 at inference.
-    model.log_target = log_target
+    # Tag the model so predict_transformer knows which inverse transform to
+    # apply at inference. target_mode is the Run 3 attribute; log_target is
+    # kept for backward compat with Run 2 checkpoints.
+    model.target_mode = target_mode
+    model.log_target = (target_mode == "log")
 
     # Save final
     torch.save(model.state_dict(), os.path.join(checkpoint_dir, "final_model.pt"))

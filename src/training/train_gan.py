@@ -25,7 +25,7 @@ def train_timegan(
     batch_size=128,
     phase1_epochs=200,
     phase2_epochs=200,
-    phase3_epochs=500,
+    phase3_epochs=300,
     lr=1e-3,
     lr_d=None,
     lr_g=None,
@@ -47,6 +47,9 @@ def train_timegan(
         GRU hidden dimension.
     batch_size : int
     phase1_epochs, phase2_epochs, phase3_epochs : int
+        Phase 3 is capped at 300 because the Run 2 curves showed D climbing
+        and G falling after ~300 epochs — the generator was starting to
+        exploit a weakening discriminator rather than converging.
     lr : float
         Learning rate for all optimizers.
     device : torch.device or None

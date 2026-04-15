@@ -128,49 +128,58 @@ class TransformerPricingNetwork(nn.Module):
         return price
 
 
-def build_transformer(input_dim=24, d_model=64, n_heads=4, d_ff=256,
-                      n_layers=3, dropout=0.1, seq_len=60):
-    """Factory function for creating a TransformerPricingNetwork with standard config."""
+def build_transformer(input_dim=20, d_model=64, n_heads=4, d_ff=256,
+                      n_layers=3, dropout=0.1, seq_len=30):
+    """Factory function for creating a TransformerPricingNetwork.
+
+    Run 3 defaults: 16 market features (macros dropped, per ablation A2) +
+    4 contract params = 20 input_dim; seq_len=30 (per ablation A3).
+    Run 2 baseline was input_dim=24, seq_len=60.
+    """
     return TransformerPricingNetwork(
         input_dim=input_dim, d_model=d_model, n_heads=n_heads,
         d_ff=d_ff, n_layers=n_layers, dropout=dropout, seq_len=seq_len,
     )
 
 
-def build_ablation_transformer(ablation_id, seq_len=60):
+def build_ablation_transformer(ablation_id, seq_len=30):
     """
     Build a Transformer variant for a specific ablation study.
+
+    Each ablation is a delta from the Run 3 baseline (16 market features,
+    seq_len=30, 3 layers). A1/A2/A6 change the feature count; A3/A4 change
+    the context window; A5 changes the depth.
 
     Parameters
     ----------
     ablation_id : str
         One of: A1, A2, A3, A4, A5, A6.
     seq_len : int
-        Override sequence length (used by A3, A4).
+        Ignored for ablations that override it (A3, A4).
 
     Returns
     -------
     TransformerPricingNetwork
     """
-    # Default config
-    config = dict(input_dim=24, d_model=64, n_heads=4, d_ff=256,
+    # Run 3 baseline config
+    config = dict(input_dim=20, d_model=64, n_heads=4, d_ff=256,
                   n_layers=3, dropout=0.1, seq_len=seq_len)
 
     if ablation_id == "A1":
-        # Remove vix_slope and vix_6m_slope: 20 -> 18 features, +4 contract = 22
-        config["input_dim"] = 22
+        # Drop vix_slope + vix_6m_slope on top of baseline: 14 features + 4 = 18
+        config["input_dim"] = 18
     elif ablation_id == "A2":
-        # Remove 4 macro features: 20 -> 16 features, +4 contract = 20
-        config["input_dim"] = 20
+        # Re-add the 4 macro features: 20 features + 4 = 24
+        config["input_dim"] = 24
     elif ablation_id == "A3":
         config["seq_len"] = 20
     elif ablation_id == "A4":
-        config["seq_len"] = 120
+        config["seq_len"] = 60
     elif ablation_id == "A5":
         config["n_layers"] = 1
     elif ablation_id == "A6":
-        # Remove vol_regime: 20 -> 19 features, +4 contract = 23
-        config["input_dim"] = 23
+        # Drop vol_regime on top of baseline: 15 features + 4 = 19
+        config["input_dim"] = 19
     else:
         raise ValueError(f"Unknown ablation ID: {ablation_id}")
 

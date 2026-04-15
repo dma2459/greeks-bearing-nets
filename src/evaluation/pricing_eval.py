@@ -83,17 +83,31 @@ def predict_transformer(model, opts_df, sequences=None, batch_size=512, device=N
     dataset = OptionsDataset(opts_df, sequences)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
+    # Figure out which inverse transform to apply. Run 3 uses target_mode;
+    # Run 2 checkpoints only have log_target — honor both for compatibility.
+    target_mode = getattr(model, "target_mode", None)
+    if target_mode is None:
+        target_mode = "log" if getattr(model, "log_target", False) else "raw"
+
     model = model.to(device).eval()
     preds = []
+    intrinsics = []  # only needed when target_mode == "time_value"
     with torch.no_grad():
         for inputs, _ in loader:
             inputs = inputs.to(device)
             out = model(inputs)
             preds.append(out.cpu().numpy())
+            if target_mode == "time_value":
+                # Contract params are tiled across the time dim; read from step 0.
+                K = inputs[:, 0, -4].cpu().numpy()
+                moneyness = inputs[:, 0, -1].cpu().numpy()
+                intrinsics.append(np.maximum((moneyness - 1.0) * K, 0.0))
 
     raw = np.concatenate(preds, axis=0).flatten()
-    # Inverse of the log1p target transform used in train_transformer.
-    if getattr(model, "log_target", False):
+    if target_mode == "time_value":
+        intrinsic = np.concatenate(intrinsics, axis=0)
+        raw = np.expm1(raw) + intrinsic
+    elif target_mode == "log":
         raw = np.expm1(raw)
     # Clamp to non-negative (the head no longer has a final ReLU — that was
     # causing A3/A6 to collapse to the dead-ReLU "predict 0 always" minimum).
@@ -104,29 +118,12 @@ def modify_sequences_for_ablation(sequences, ablation_id):
     """
     Modify sequences array for a specific ablation study.
 
-    Returns a new sequences array with the appropriate feature/length changes.
+    Thin wrapper around src.data.preprocess.prepare_ablation_sequences. Expects
+    raw (N, 60, 20) input and returns the properly-prepped sequences for the
+    ablation (feature drops + seq_len slicing as defined by Run 3 baseline).
     """
-    if ablation_id == "A1":
-        # Remove vix_slope (col 6) and vix_6m_slope (col 7)
-        return np.delete(sequences, [6, 7], axis=2)
-    elif ablation_id == "A2":
-        # Remove credit_spread (14), treasury_2y (16), put_call_ratio (17), dxy (18)
-        return np.delete(sequences, [14, 16, 17, 18], axis=2)
-    elif ablation_id == "A3":
-        # Shorter context: last 20 steps of each 60-step sequence
-        return sequences[:, -20:, :]
-    elif ablation_id == "A4":
-        # Longer context: zero-pad to 120 steps
-        pad_len = 120 - sequences.shape[1]
-        return np.pad(sequences, ((0, 0), (pad_len, 0), (0, 0)), mode="constant")
-    elif ablation_id == "A5":
-        # Same input, different model depth
-        return sequences
-    elif ablation_id == "A6":
-        # Remove vol_regime (col 19)
-        return np.delete(sequences, [19], axis=2)
-    else:
-        raise ValueError(f"Unknown ablation ID: {ablation_id}")
+    from src.data.preprocess import prepare_ablation_sequences
+    return prepare_ablation_sequences(sequences, ablation_id)
 
 
 def predict_black_scholes(opts_df, master_df=None):
