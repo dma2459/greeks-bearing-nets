@@ -1,8 +1,19 @@
 """
 Feature engineering, normalization, sliding-window construction, and options preprocessing.
 
-All rolling features use .shift(1) before the rolling window to prevent lookahead bias.
-Scaler is fit on training data (2010-2019) only.
+Design notes
+------------
+* All rolling features use .shift(1) before the rolling window so that the
+  value at row t never depends on log_return[t] itself. This is a within-feature
+  lookahead guard, independent of the sequence slicing below.
+* Scaler is fit on training data (2010-2019) only.
+* Options preprocessing treats each contract as priced at end-of-day (EOD) on
+  its quote date t. The market-feature sequence spans
+  [t - seq_len + 1 .. t] inclusive, and contract-level inputs
+  (moneyness_input, rate_input, vol_regime_input, rv_21d_input) are taken from
+  day t. This matches how a trader at market close on day t would value
+  options using information known at that moment, and keeps the network on
+  even footing with the Black-Scholes baseline, which also uses day-t spot.
 """
 
 import os
@@ -191,7 +202,8 @@ def build_master_dataframe(spy, vix, vvix, hyg, lqd, dxy, treasury, cboe):
 
     # ── Feature engineering (Rule 5: .shift(1) before all rolling) ──
 
-    # Log return: uses close[t-1] and close[t-2] due to shift
+    # Log return at row t = log(close[t] / close[t-1]): realized return on day t,
+    # known at market close on day t.
     log_return = np.log(close / close.shift(1))
 
     # Realized volatility (annualized) — shift log_return by 1 before rolling
@@ -324,7 +336,15 @@ def build_sequences(scaled_array, seq_len=SEQ_LEN):
 
 def preprocess_options(opts_df, master_df, scaler, seq_len=SEQ_LEN):
     """
-    Filter and enrich options data with market sequences and t-1 contract features.
+    Filter and enrich options data with EOD market sequences and contract features.
+
+    For each contract whose quote date resolves to trading day t, the returned
+    sequence spans days [t - seq_len + 1 .. t] (inclusive on both ends), so the
+    final time-step is day t itself — i.e. the model sees today's closing
+    market state when pricing today's option. Contract-level inputs
+    (moneyness_input, rate_input, vol_regime_input, rv_21d_input) are likewise
+    taken from day t. This is the EOD-pricer convention; it replaces the
+    earlier day-ahead behavior where the sequence stopped at t-1.
 
     Parameters
     ----------
@@ -341,9 +361,11 @@ def preprocess_options(opts_df, master_df, scaler, seq_len=SEQ_LEN):
     -------
     (pd.DataFrame, np.ndarray)
         opts_df: Filtered options with columns: seq_idx, strike, time_to_expiry,
-            rate_input, moneyness_input, vol_regime_input, mid_price (label).
+            rate_input, moneyness_input, vol_regime_input, rv_21d_input,
+            mid_price (label). The *_input columns are all day-t values.
         sequences: Array of shape (n_unique_dates, seq_len, 20). Each option's
-            seq_idx column indexes into this array.
+            seq_idx column indexes into this array; sequences[i, -1] is day-t
+            for its corresponding quote date.
     """
     opts = opts_df.copy()
 
@@ -401,11 +423,12 @@ def preprocess_options(opts_df, master_df, scaler, seq_len=SEQ_LEN):
     trading_days = master_df.index
     date_to_iloc = {d: i for i, d in enumerate(trading_days)}
 
-    date_seq_list = []        # list of (60, 20) arrays
+    date_seq_list = []        # list of (seq_len, 20) arrays
     date_to_seq_idx = {}      # date -> index into date_seq_list
     date_spy_close = {}
     date_rate = {}
     date_vol_regime = {}
+    date_rv_21d = {}
 
     for d in opts["date"].unique():
         d_ts = pd.Timestamp(d)
@@ -416,15 +439,20 @@ def preprocess_options(opts_df, master_df, scaler, seq_len=SEQ_LEN):
             d_ts = trading_days[mask][-1]
 
         idx = date_to_iloc[d_ts]
-        if idx < seq_len:
+        # Sequence spans [idx - seq_len + 1 .. idx] inclusive — ends on day t.
+        # Need at least seq_len rows of history up to and including day t.
+        if idx < seq_len - 1:
             continue
 
         date_to_seq_idx[d] = len(date_seq_list)
-        date_seq_list.append(master_scaled_values[idx - seq_len: idx].astype(np.float32))
-        t_minus_1 = master_df.iloc[idx - 1]
-        date_spy_close[d] = t_minus_1["spy_close"]
-        date_rate[d] = t_minus_1["treasury_2y"]
-        date_vol_regime[d] = t_minus_1.get("vol_regime", 1)
+        date_seq_list.append(
+            master_scaled_values[idx - seq_len + 1: idx + 1].astype(np.float32)
+        )
+        eod = master_df.iloc[idx]  # EOD of day t (the quote date itself)
+        date_spy_close[d] = eod["spy_close"]
+        date_rate[d] = eod["treasury_2y"]
+        date_vol_regime[d] = eod.get("vol_regime", 1)
+        date_rv_21d[d] = eod.get("rv_21d", np.nan)
 
     # Stack into a single array: (n_unique_dates, seq_len, 20)
     sequences_array = np.stack(date_seq_list) if date_seq_list else np.empty((0, seq_len, len(FEATURE_COLS)), dtype=np.float32)
@@ -438,6 +466,7 @@ def preprocess_options(opts_df, master_df, scaler, seq_len=SEQ_LEN):
     opts["moneyness_input"] = opts["date"].map(date_spy_close) / opts["strike"]
     opts["rate_input"] = opts["date"].map(date_rate)
     opts["vol_regime_input"] = opts["date"].map(date_vol_regime)
+    opts["rv_21d_input"] = opts["date"].map(date_rv_21d)
 
     opts = opts.reset_index(drop=True)
 

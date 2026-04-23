@@ -8,18 +8,23 @@ def black_scholes_call(S, K, T, r, sigma):
     """
     Compute Black-Scholes European call option price.
 
+    Inputs are expected at day-t EOD (the contract's quote date), matching the
+    EOD convention used throughout preprocess_options and the Transformer's
+    sequence input.
+
     Parameters
     ----------
     S : float or array
-        Current underlying price (SPY close at t-1).
+        Underlying price at day-t close (SPY close on the quote date).
     K : float or array
         Strike price.
     T : float or array
         Time to expiry in years.
     r : float or array
-        Risk-free rate (treasury_2y at t-1).
+        Risk-free rate at day-t (treasury_2y on the quote date).
     sigma : float or array
-        Volatility input (rv_21d at t-1).
+        Historical realized vol at day-t (rv_21d, computed from log_returns
+        up to t-1 and known at close on day t).
 
     Returns
     -------

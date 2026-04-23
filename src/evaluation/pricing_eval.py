@@ -128,15 +128,20 @@ def modify_sequences_for_ablation(sequences, ablation_id):
 
 def predict_black_scholes(opts_df, master_df=None):
     """
-    Compute Black-Scholes prices for each option using t-1 values.
+    Compute Black-Scholes prices for each option using day-t (EOD) values.
+
+    S, r, and sigma are all taken from trading day t — the contract's quote
+    date — matching the EOD convention used by preprocess_options. This puts
+    BS on equal footing with the Transformer, which also sees day-t market
+    state in its input sequence.
 
     Parameters
     ----------
     opts_df : pd.DataFrame
         Must have: strike, time_to_expiry, rate_input, moneyness_input.
-        If moneyness_input exists, S = moneyness_input * strike.
+        If rv_21d_input is present, it is used directly for sigma.
     master_df : pd.DataFrame or None
-        If provided, look up rv_21d at t-1 for sigma.
+        Fallback source for sigma when rv_21d_input/rv_21d are absent.
 
     Returns
     -------
@@ -148,27 +153,29 @@ def predict_black_scholes(opts_df, master_df=None):
     T = opts_df["time_to_expiry"].values
     r = opts_df["rate_input"].values
 
-    # For sigma, use rv_21d at t-1. If stored in opts_df, use it directly.
-    if "rv_21d" in opts_df.columns:
-        sigma = opts_df["rv_21d"].values
+    # Prefer the day-t rv_21d populated by preprocess_options.
+    if "rv_21d_input" in opts_df.columns:
+        sigma = opts_df["rv_21d_input"].values.astype(np.float64)
+    elif "rv_21d" in opts_df.columns:
+        sigma = opts_df["rv_21d"].values.astype(np.float64)
     elif master_df is not None and "rv_21d" in master_df.columns:
-        # Look up rv_21d for each contract's date
+        # Fallback: look up day-t rv_21d (last trading day <= quote date).
         sigmas = []
         trading_days = master_df.index
         for _, row in opts_df.iterrows():
             d = row["date"]
             mask = trading_days <= d
-            if mask.sum() >= 2:
-                # t-1 value
-                idx = trading_days[mask][-2]
+            if mask.any():
+                idx = trading_days[mask][-1]  # day-t
                 sigmas.append(master_df.loc[idx, "rv_21d"])
             else:
-                sigmas.append(0.2)  # fallback
-        sigma = np.array(sigmas)
+                sigmas.append(0.2)
+        sigma = np.array(sigmas, dtype=np.float64)
     else:
-        # Fallback: use VIX / 100 as proxy
         sigma = np.full(len(opts_df), 0.2)
 
+    # Any NaNs (e.g. early-history rv_21d warmup) fall back to a reasonable default.
+    sigma = np.where(np.isnan(sigma), 0.2, sigma)
     # Guard against zero sigma
     sigma = np.maximum(sigma, 0.01)
 
