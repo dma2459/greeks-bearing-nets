@@ -1,9 +1,11 @@
 """
 Transformer Pricing Network for European call option pricing.
 
-Takes a 60-day market feature sequence (+ tiled contract params) and predicts
-the option price. Architecture: sinusoidal positional encoding, input projection,
-3 encoder blocks, global average pooling, prediction head.
+Takes a market feature sequence (+ tiled 8-feature contract block) and predicts
+the option price. Architecture: sinusoidal positional encoding on the input
+dim, input projection to d_model, N encoder blocks, global average pooling
+over time, and an MLP head that emits a scalar (clamped non-negative at
+inference via the target-space inverse transform, not a final ReLU).
 """
 
 import math
@@ -53,52 +55,75 @@ class TransformerEncoderBlock(nn.Module):
 
     def forward(self, x):
         """x: (batch, seq_len, d_model) -> same shape."""
-        # Self-attention
         attn_out, _ = self.attn(x, x, x)
         x = self.norm1(x + self.dropout(attn_out))
-        # Feed-forward
         ff_out = self.ff(x)
         x = self.norm2(x + self.dropout(ff_out))
         return x
 
 
-class TransformerPricingNetwork(nn.Module):
+def _build_head(d_model, dropout, head_size="standard"):
     """
-    Full Transformer pricing network.
+    Build the prediction head.
 
-    Input:  (batch, 60, 24)   20 market features + 4 contract params
-    Output: (batch, 1)        predicted option price (clamped non-negative at inference)
+    head_size:
+        "standard" — Linear(64) → ReLU → Dropout → Linear(32) → ReLU → Linear(1)
+        "deep"     — Linear(128) → ReLU → Dropout → Linear(64) → ReLU →
+                     Dropout → Linear(32) → ReLU → Linear(1)
+                     Used by B-series ablation B6.
     """
-
-    def __init__(self, input_dim=24, d_model=64, n_heads=4, d_ff=256,
-                 n_layers=3, dropout=0.1, seq_len=60):
-        super().__init__()
-        self.input_dim = input_dim
-        self.d_model = d_model
-
-        # Positional encoding operates on input_dim, then we project
-        self.pos_enc = SinusoidalPositionalEncoding(input_dim, max_len=seq_len + 10)
-        self.input_proj = nn.Linear(input_dim, d_model)
-
-        # Encoder stack
-        self.encoder_blocks = nn.ModuleList([
-            TransformerEncoderBlock(d_model, n_heads, d_ff, dropout)
-            for _ in range(n_layers)
-        ])
-
-        # Prediction head — final softplus keeps prices non-negative without
-        # the dead-ReLU collapse that caused A3/A6 to output all zeros.
-        self.head = nn.Sequential(
-            nn.Linear(d_model, 64),
+    if head_size == "deep":
+        return nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(64, 32),
             nn.ReLU(),
             nn.Linear(32, 1),
         )
+    return nn.Sequential(
+        nn.Linear(d_model, 64),
+        nn.ReLU(),
+        nn.Dropout(dropout),
+        nn.Linear(64, 32),
+        nn.ReLU(),
+        nn.Linear(32, 1),
+    )
+
+
+class TransformerPricingNetwork(nn.Module):
+    """
+    Full Transformer pricing network.
+
+    Input:  (batch, seq_len, input_dim)
+        Run 4 default: 16 market features + 8 augmented contract features = 24
+    Output: (batch, 1) predicted option price in target space; the inverse
+        transform (log1p / time-value intrinsic add-back) is applied in
+        predict_transformer at inference.
+    """
+
+    def __init__(self, input_dim=24, d_model=64, n_heads=4, d_ff=256,
+                 n_layers=3, dropout=0.1, seq_len=30, head_size="standard"):
+        super().__init__()
+        self.input_dim = input_dim
+        self.d_model = d_model
+
+        self.pos_enc = SinusoidalPositionalEncoding(input_dim, max_len=seq_len + 10)
+        self.input_proj = nn.Linear(input_dim, d_model)
+
+        self.encoder_blocks = nn.ModuleList([
+            TransformerEncoderBlock(d_model, n_heads, d_ff, dropout)
+            for _ in range(n_layers)
+        ])
+
+        self.head = _build_head(d_model, dropout, head_size=head_size)
 
         # Warm-start the final bias near the mean option price so the network
-        # doesn't have to climb out of zero. 15 ~= mean(mid_price) on this data.
+        # doesn't have to climb out of zero. train_transformer overrides this
+        # based on target_mode ("raw" / "log" / "time_value").
         with torch.no_grad():
             self.head[-1].bias.fill_(15.0)
 
@@ -112,65 +137,77 @@ class TransformerPricingNetwork(nn.Module):
         -------
         price : Tensor, shape (batch, 1)
         """
-        # Positional encoding + projection
         x = self.pos_enc(x)
-        x = self.input_proj(x)  # (batch, seq_len, d_model)
+        x = self.input_proj(x)
 
-        # Encoder stack
         for block in self.encoder_blocks:
             x = block(x)
 
-        # Global average pooling over sequence dimension
         x = x.mean(dim=1)  # (batch, d_model)
 
-        # Prediction
-        price = self.head(x)  # (batch, 1)
+        price = self.head(x)
         return price
 
 
-def build_transformer(input_dim=20, d_model=64, n_heads=4, d_ff=256,
-                      n_layers=3, dropout=0.1, seq_len=30):
+def build_transformer(input_dim=24, d_model=64, n_heads=4, d_ff=256,
+                      n_layers=3, dropout=0.1, seq_len=30, head_size="standard"):
     """Factory function for creating a TransformerPricingNetwork.
 
-    Run 3 defaults: 16 market features (macros dropped, per ablation A2) +
-    4 contract params = 20 input_dim; seq_len=30 (per ablation A3).
-    Run 2 baseline was input_dim=24, seq_len=60.
+    Run 4 defaults: 16 market features (macros dropped, per ablation A2) +
+    8 augmented contract features = 24 input_dim; seq_len=30 (per ablation A3).
+    Run 3 baseline was input_dim=20 (pre-augmentation).
     """
     return TransformerPricingNetwork(
         input_dim=input_dim, d_model=d_model, n_heads=n_heads,
         d_ff=d_ff, n_layers=n_layers, dropout=dropout, seq_len=seq_len,
+        head_size=head_size,
     )
+
+
+# Augmented contract block adds 4 channels to every model input_dim.
+_CONTRACT_PAD = 4
 
 
 def build_ablation_transformer(ablation_id, seq_len=30):
     """
     Build a Transformer variant for a specific ablation study.
 
-    Each ablation is a delta from the Run 3 baseline (16 market features,
-    seq_len=30, 3 layers). A1/A2/A6 change the feature count; A3/A4 change
-    the context window; A5 changes the depth.
+    A-series (feature/context/depth deltas from Run 3 baseline):
+        A1 — drop VIX slope features:     14 market + 8 contract = 22
+        A2 — keep the macro features:     20 market + 8 contract = 28
+        A3 — shorter context window:      seq_len = 20
+        A4 — longer context window:       seq_len = 60
+        A5 — single encoder block
+        A6 — drop vol_regime:             15 market + 8 contract = 23
+
+    B-series (Step 3 architecture sweep from Run 4 baseline):
+        B1 — deeper encoder (n_layers=5)
+        B2 — wider model   (d_model=128)
+        B3 — more heads    (n_heads=8)
+        B4 — more dropout  (dropout=0.3)
+        B5 — reserved for LR-schedule ablation (handled in training loop;
+             the model config equals baseline)
+        B6 — deeper prediction head (head_size="deep")
 
     Parameters
     ----------
     ablation_id : str
-        One of: A1, A2, A3, A4, A5, A6.
+        One of A1-A6 or B1-B6.
     seq_len : int
-        Ignored for ablations that override it (A3, A4).
+        Default context length. Overridden for A3/A4.
 
     Returns
     -------
     TransformerPricingNetwork
     """
-    # Run 3 baseline config
-    config = dict(input_dim=20, d_model=64, n_heads=4, d_ff=256,
-                  n_layers=3, dropout=0.1, seq_len=seq_len)
+    config = dict(input_dim=24, d_model=64, n_heads=4, d_ff=256,
+                  n_layers=3, dropout=0.1, seq_len=seq_len,
+                  head_size="standard")
 
     if ablation_id == "A1":
-        # Drop vix_slope + vix_6m_slope on top of baseline: 14 features + 4 = 18
-        config["input_dim"] = 18
+        config["input_dim"] = 14 + _CONTRACT_PAD + 4  # 22
     elif ablation_id == "A2":
-        # Re-add the 4 macro features: 20 features + 4 = 24
-        config["input_dim"] = 24
+        config["input_dim"] = 20 + _CONTRACT_PAD + 4  # 28
     elif ablation_id == "A3":
         config["seq_len"] = 20
     elif ablation_id == "A4":
@@ -178,8 +215,19 @@ def build_ablation_transformer(ablation_id, seq_len=30):
     elif ablation_id == "A5":
         config["n_layers"] = 1
     elif ablation_id == "A6":
-        # Drop vol_regime on top of baseline: 15 features + 4 = 19
-        config["input_dim"] = 19
+        config["input_dim"] = 15 + _CONTRACT_PAD + 4  # 23
+    elif ablation_id == "B1":
+        config["n_layers"] = 5
+    elif ablation_id == "B2":
+        config["d_model"] = 128
+    elif ablation_id == "B3":
+        config["n_heads"] = 8
+    elif ablation_id == "B4":
+        config["dropout"] = 0.3
+    elif ablation_id == "B5":
+        pass  # baseline config; train_transformer receives the LR-schedule changes
+    elif ablation_id == "B6":
+        config["head_size"] = "deep"
     else:
         raise ValueError(f"Unknown ablation ID: {ablation_id}")
 

@@ -98,9 +98,10 @@ def predict_transformer(model, opts_df, sequences=None, batch_size=512, device=N
             out = model(inputs)
             preds.append(out.cpu().numpy())
             if target_mode == "time_value":
-                # Contract params are tiled across the time dim; read from step 0.
-                K = inputs[:, 0, -4].cpu().numpy()
-                moneyness = inputs[:, 0, -1].cpu().numpy()
+                # Contract block is 8-wide; K at channel -8, moneyness at -5
+                # (see src/data/dataset.py:augment_contract_features).
+                K = inputs[:, 0, -8].cpu().numpy()
+                moneyness = inputs[:, 0, -5].cpu().numpy()
                 intrinsics.append(np.maximum((moneyness - 1.0) * K, 0.0))
 
     raw = np.concatenate(preds, axis=0).flatten()

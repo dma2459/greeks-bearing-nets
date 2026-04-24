@@ -2,7 +2,9 @@
 Transformer pricing network training with experiment management.
 
 Supports three training experiments (A: Heston only, B: GAN only, C: mixed)
-and ablation studies. Includes early stopping and LR scheduling.
+and ablation studies. Includes early stopping and LR scheduling. Optional
+weighted loss (Step 2) focuses the network on ATM and high-vol samples, which
+are where the Run 3 model trailed Black-Scholes most.
 """
 
 import os
@@ -15,6 +17,17 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
 from src.models.transformer import TransformerPricingNetwork, build_transformer, build_ablation_transformer
+
+
+# Channel offsets within the 8-wide augmented contract block (appended at the
+# end of every input tensor — see src/data/dataset.py:augment_contract_features).
+#   [-8] K              [-4] log_moneyness
+#   [-7] T              [-3] sqrt_T
+#   [-6] r              [-2] atm_bell
+#   [-5] moneyness      [-1] abs_moneyness_dist
+CONTRACT_K_IDX = -8
+CONTRACT_T_IDX = -7
+CONTRACT_MONEYNESS_IDX = -5
 
 
 def train_transformer(
@@ -33,6 +46,9 @@ def train_transformer(
     experiment_name="experiment",
     log_every=1,
     target_mode="time_value",
+    loss_weighting=None,
+    atm_alpha=2.0,
+    vol_alpha=1.0,
 ):
     """
     Train a Transformer pricing network with early stopping and LR scheduling.
@@ -41,11 +57,10 @@ def train_transformer(
     ----------
     model : TransformerPricingNetwork
     train_dataset : Dataset
-        Must return (input, label) tuples. Input tensor's last 4 features
-        along the channel dim must be the tiled contract params in the
-        order [strike, time_to_expiry, rate, moneyness].
+        Must return (input, label) tuples. Input tensor's last 8 channels
+        are the augmented contract block [K, T, r, moneyness, log_moneyness,
+        sqrt_T, atm_bell, abs_moneyness_dist].
     val_dataset : Dataset or None
-        If None, split from train_dataset using val_split.
     val_split : float
         Fraction for validation if val_dataset is None.
     batch_size : int
@@ -73,7 +88,24 @@ def train_transformer(
           learns the volatility premium; intrinsic value is computed
           analytically at inference. This keeps ITM numerically tractable
           because the network never has to reconstruct $50 of intrinsic
-          from features. Default for Run 3.
+          from features. Default for Run 3+.
+
+    loss_weighting : str or None
+        Optional per-sample weighting for the MSE loss (Step 2).
+
+        - None      : plain MSE (default).
+        - "atm"     : weight = 1 + atm_alpha * bell(moneyness - 1).
+                      Emphasizes options near moneyness=1.0, where Run 3
+                      trailed BS by $2.20 on MAE.
+        - "vol"     : weight = 1 + vol_alpha * normalized_time_value.
+                      Emphasizes high vega-normalized time value as a proxy
+                      for high implied vol (doesn't require a separate
+                      feature channel to work across ablations).
+        - "atm_vol" : sum of the two boosts.
+
+    atm_alpha, vol_alpha : float
+        Scale of the ATM / vol weighting boosts. Defaults make deep-ATM
+        samples ~3x weighted and high-vol samples up to ~2x.
 
     Returns
     -------
@@ -84,10 +116,14 @@ def train_transformer(
     """
     if target_mode not in ("raw", "log", "time_value"):
         raise ValueError(f"target_mode must be raw|log|time_value, got {target_mode!r}")
+    if loss_weighting not in (None, "atm", "vol", "atm_vol"):
+        raise ValueError(f"loss_weighting must be None|atm|vol|atm_vol, got {loss_weighting!r}")
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else
                               "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Training '{experiment_name}' on: {device}")
+    if loss_weighting is not None:
+        print(f"  Loss weighting: {loss_weighting} (atm_alpha={atm_alpha}, vol_alpha={vol_alpha})")
 
     if checkpoint_dir is None:
         checkpoint_dir = os.path.join("checkpoints", "transformer", experiment_name)
@@ -132,24 +168,48 @@ def train_transformer(
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=lr_factor, patience=lr_patience,
     )
-    criterion = nn.MSELoss()
 
     def _transform_label(y, inputs):
         """Transform raw-price labels to the training target space.
 
-        inputs carries contract params at channels [-4:]; we need strike
-        (channel -4) and moneyness = S/K (channel -1) to compute intrinsic.
+        Contract block is 8-wide; K and moneyness live at CONTRACT_K_IDX /
+        CONTRACT_MONEYNESS_IDX. Slice notation keeps the (batch, 1) shape.
         """
         if target_mode == "raw":
             return y
         if target_mode == "log":
             return torch.log1p(torch.clamp(y, min=0.0))
-        # time_value — keep dims aligned with y (batch, 1) via slice notation
-        K = inputs[:, 0, -4:-3]
-        moneyness = inputs[:, 0, -1:]
+        K = inputs[:, 0, CONTRACT_K_IDX:CONTRACT_K_IDX + 1]
+        moneyness = inputs[:, 0, CONTRACT_MONEYNESS_IDX:CONTRACT_MONEYNESS_IDX + 1]
         intrinsic = torch.clamp((moneyness - 1.0) * K, min=0.0)
         time_value = torch.clamp(y - intrinsic, min=0.0)
         return torch.log1p(time_value)
+
+    def _compute_weights(y_raw, inputs):
+        """Per-sample loss weights. Returns None when weighting is disabled."""
+        if loss_weighting is None:
+            return None
+        moneyness = inputs[:, 0, CONTRACT_MONEYNESS_IDX]
+        weight = torch.ones_like(moneyness)
+        if loss_weighting in ("atm", "atm_vol"):
+            atm_bell = torch.exp(-((moneyness - 1.0) ** 2) / 0.02)
+            weight = weight + atm_alpha * atm_bell
+        if loss_weighting in ("vol", "atm_vol"):
+            K = inputs[:, 0, CONTRACT_K_IDX]
+            T = inputs[:, 0, CONTRACT_T_IDX]
+            price = y_raw.squeeze(-1)
+            intrinsic = torch.clamp((moneyness - 1.0) * K, min=0.0)
+            time_value = torch.clamp(price - intrinsic, min=0.0)
+            denom = torch.clamp(K * torch.sqrt(torch.clamp(T, min=1e-6)), min=1e-3)
+            vol_proxy = torch.tanh((time_value / denom) * 10.0)
+            weight = weight + vol_alpha * vol_proxy
+        return weight
+
+    def _loss(preds, labels, weights):
+        if weights is None:
+            return nn.functional.mse_loss(preds, labels)
+        w = weights.view(-1, 1)
+        return (w * (preds - labels) ** 2).sum() / w.sum()
 
     history = {"train_loss": [], "val_loss": [], "lr": []}
     best_val_loss = float("inf")
@@ -163,10 +223,12 @@ def train_transformer(
         n_batches = 0
         for inputs, labels in train_loader:
             inputs = inputs.to(device)
-            labels = _transform_label(labels.to(device), inputs)
+            labels_raw = labels.to(device)
+            labels_t = _transform_label(labels_raw, inputs)
+            weights = _compute_weights(labels_raw, inputs)
 
             preds = model(inputs)
-            loss = criterion(preds, labels)
+            loss = _loss(preds, labels_t, weights)
 
             optimizer.zero_grad()
             loss.backward()
@@ -185,9 +247,11 @@ def train_transformer(
         with torch.no_grad():
             for inputs, labels in val_loader:
                 inputs = inputs.to(device)
-                labels = _transform_label(labels.to(device), inputs)
+                labels_raw = labels.to(device)
+                labels_t = _transform_label(labels_raw, inputs)
+                weights = _compute_weights(labels_raw, inputs)
                 preds = model(inputs)
-                loss = criterion(preds, labels)
+                loss = _loss(preds, labels_t, weights)
                 val_loss_sum += loss.item()
                 n_val_batches += 1
 
@@ -223,7 +287,7 @@ def train_transformer(
     model = model.cpu()
 
     # Tag the model so predict_transformer knows which inverse transform to
-    # apply at inference. target_mode is the Run 3 attribute; log_target is
+    # apply at inference. target_mode is the Run 3+ attribute; log_target is
     # kept for backward compat with Run 2 checkpoints.
     model.target_mode = target_mode
     model.log_target = (target_mode == "log")
@@ -264,14 +328,16 @@ def run_experiment(experiment_id, train_dataset, device=None, **kwargs):
     )
 
 
-def run_ablation(ablation_id, train_dataset, seq_len=60, device=None, **kwargs):
+def run_ablation(ablation_id, train_dataset, seq_len=30, device=None, **kwargs):
     """
     Run a single ablation study.
 
     Parameters
     ----------
     ablation_id : str
-        One of: A1-A7.
+        One of A1-A6 (feature/context ablations) or B1-B6 (Step 3 architecture
+        sweep). B5 is the LR-schedule ablation and picks up slower decay
+        defaults here rather than a model-level change.
     train_dataset : Dataset
     seq_len : int
     device : torch.device or None
@@ -289,8 +355,15 @@ def run_ablation(ablation_id, train_dataset, seq_len=60, device=None, **kwargs):
         # A7 is Heston vs GAN vs mixed — handled at the dataset level
         model = build_transformer()
     else:
-        override_seq_len = {"A3": 20, "A4": 120}.get(ablation_id, seq_len)
+        override_seq_len = {"A3": 20, "A4": 60}.get(ablation_id, seq_len)
         model = build_ablation_transformer(ablation_id, seq_len=override_seq_len)
+
+    # B5 is the LR-schedule ablation: double ReduceLROnPlateau patience and
+    # halve the decay factor so the model spends longer at each LR before
+    # stepping down. Caller can still override either via kwargs.
+    if ablation_id == "B5":
+        kwargs.setdefault("lr_patience", 10)
+        kwargs.setdefault("lr_factor", 0.25)
 
     return train_transformer(
         model, train_dataset,
