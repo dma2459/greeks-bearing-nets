@@ -2,17 +2,26 @@
 Transformer pricing network training with experiment management.
 
 Supports three training experiments (A: Heston only, B: GAN only, C: mixed)
-and ablation studies. Includes early stopping and LR scheduling. Optional
-weighted loss (Step 2) focuses the network on ATM and high-vol samples, which
-are where the Run 3 model trailed Black-Scholes most.
+and ablation studies. Includes early stopping, configurable LR scheduling
+(ReduceLROnPlateau or linear-warmup + cosine), and per-epoch logging of
+validation MAE in raw dollars (not just the target-space MSE loss).
+
+Run 4 additions:
+- Contract block augmentation is handled by the Dataset layer (see
+  src.data.dataset.augment_contract_features); inputs here are 8-wide
+  on the contract side with known channel offsets below.
+- loss_weighting emphasizes ATM and high-vol samples.
+- lr_schedule='warmup_cosine' is the Vaswani 2017 recipe; Step 3 B5 uses it.
 """
 
 import os
 import copy
+import math
 import time
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
@@ -30,6 +39,51 @@ CONTRACT_T_IDX = -7
 CONTRACT_MONEYNESS_IDX = -5
 
 
+def _build_scheduler(optimizer, schedule, *, total_steps, warmup_steps,
+                     lr_min_ratio, lr_patience, lr_factor):
+    """
+    Return (scheduler, step_per_batch).
+
+    - "plateau" : ReduceLROnPlateau on val loss. Step once per epoch with the
+       val metric. step_per_batch=False.
+    - "warmup_cosine" : LambdaLR that ramps linearly from 0 → peak over
+       `warmup_steps` batches, then cosines down to `peak * lr_min_ratio` over
+       the remaining `total_steps - warmup_steps`. Standard Transformer recipe;
+       step_per_batch=True (step after every optimizer.step()).
+    """
+    if schedule == "plateau":
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=lr_factor, patience=lr_patience,
+        )
+        return sched, False
+    if schedule == "warmup_cosine":
+        warmup_steps = max(1, int(warmup_steps))
+        total_steps = max(warmup_steps + 1, int(total_steps))
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return (step + 1) / warmup_steps
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            progress = min(1.0, progress)
+            return lr_min_ratio + (1.0 - lr_min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        return LambdaLR(optimizer, lr_lambda), True
+    raise ValueError(f"lr_schedule must be 'plateau' or 'warmup_cosine', got {schedule!r}")
+
+
+def _invert_preds(preds, inputs, target_mode):
+    """Invert target-space predictions back to raw price for diagnostic MAE."""
+    if target_mode == "raw":
+        return preds
+    if target_mode == "log":
+        return torch.clamp(torch.expm1(preds), min=0.0)
+    # time_value
+    K = inputs[:, 0, CONTRACT_K_IDX:CONTRACT_K_IDX + 1]
+    moneyness = inputs[:, 0, CONTRACT_MONEYNESS_IDX:CONTRACT_MONEYNESS_IDX + 1]
+    intrinsic = torch.clamp((moneyness - 1.0) * K, min=0.0)
+    return torch.clamp(torch.expm1(preds) + intrinsic, min=0.0)
+
+
 def train_transformer(
     model,
     train_dataset,
@@ -41,6 +95,9 @@ def train_transformer(
     patience=10,
     lr_patience=5,
     lr_factor=0.5,
+    lr_schedule="plateau",
+    warmup_steps=300,
+    lr_min_ratio=0.01,
     device=None,
     checkpoint_dir=None,
     experiment_name="experiment",
@@ -62,66 +119,61 @@ def train_transformer(
         sqrt_T, atm_bell, abs_moneyness_dist].
     val_dataset : Dataset or None
     val_split : float
-        Fraction for validation if val_dataset is None.
     batch_size : int
     max_epochs : int
     lr : float
+        Peak learning rate (constant for 'plateau', reached after warmup
+        for 'warmup_cosine').
     patience : int
-        Early stopping patience.
+        Early-stopping patience on val loss.
     lr_patience : int
-        ReduceLROnPlateau patience.
     lr_factor : float
-        LR reduction factor.
-    device : torch.device or None
-    checkpoint_dir : str or None
-    experiment_name : str
-    log_every : int
-    target_mode : str
-        One of "raw", "log", "time_value".
-
-        - "raw" : fit raw price directly. Overweights expensive ITM
-          options and starves OTM learning (Run 1 failure mode).
-        - "log" : fit log1p(price). Equalizes relative error across
-          moneyness but underweights ITM, pushing ATM/ITM error higher
-          (Run 2 failure mode — caused A to regress at ATM/ITM).
-        - "time_value" : fit log1p(price - max(S-K, 0)). The model only
-          learns the volatility premium; intrinsic value is computed
-          analytically at inference. This keeps ITM numerically tractable
-          because the network never has to reconstruct $50 of intrinsic
-          from features. Default for Run 3+.
-
-    loss_weighting : str or None
-        Optional per-sample weighting for the MSE loss (Step 2).
-
-        - None      : plain MSE (default).
-        - "atm"     : weight = 1 + atm_alpha * bell(moneyness - 1).
-                      Emphasizes options near moneyness=1.0, where Run 3
-                      trailed BS by $2.20 on MAE.
-        - "vol"     : weight = 1 + vol_alpha * normalized_time_value.
-                      Emphasizes high vega-normalized time value as a proxy
-                      for high implied vol (doesn't require a separate
-                      feature channel to work across ablations).
-        - "atm_vol" : sum of the two boosts.
-
+        Only used when lr_schedule='plateau'.
+    lr_schedule : str
+        'plateau' (default) — Adam + ReduceLROnPlateau on val loss. Abrupt
+        step drops; prone to jagged curves in the first few epochs before
+        Adam's moving averages stabilize.
+        'warmup_cosine' — linear warmup for `warmup_steps` batches, then
+        cosine decay to `lr * lr_min_ratio`. Vaswani 2017 recipe; smoother
+        convergence; `lr_patience` / `lr_factor` are ignored.
+    warmup_steps : int
+        Linear warmup length in batches. ~1-2 epochs' worth is typical.
+    lr_min_ratio : float
+        Terminal LR as fraction of peak LR under 'warmup_cosine'.
+    device, checkpoint_dir, experiment_name, log_every : as before
+    target_mode : 'raw' | 'log' | 'time_value'
+    loss_weighting : None | 'atm' | 'vol' | 'atm_vol'
+        Per-sample MSE weighting (Step 2). See earlier docstring for the
+        full semantics.
     atm_alpha, vol_alpha : float
-        Scale of the ATM / vol weighting boosts. Defaults make deep-ATM
-        samples ~3x weighted and high-vol samples up to ~2x.
 
     Returns
     -------
-    model : TransformerPricingNetwork
-        Best model (on CPU).
-    dict
-        Training history.
+    model : TransformerPricingNetwork (best model, on CPU)
+    history : dict with keys
+        train_loss, val_loss (target-space MSE),
+        val_mae_dollars (raw-price MAE on val set — the metric we actually
+            report on test, tracked per-epoch so you can see real-dollar
+            progress, not just an opaque target-space number),
+        lr, grad_norm (pre-clip, averaged per epoch — diagnostic for
+            'is training still stable?').
     """
     if target_mode not in ("raw", "log", "time_value"):
         raise ValueError(f"target_mode must be raw|log|time_value, got {target_mode!r}")
     if loss_weighting not in (None, "atm", "vol", "atm_vol"):
         raise ValueError(f"loss_weighting must be None|atm|vol|atm_vol, got {loss_weighting!r}")
+    if lr_schedule not in ("plateau", "warmup_cosine"):
+        raise ValueError(f"lr_schedule must be plateau|warmup_cosine, got {lr_schedule!r}")
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else
                               "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Training '{experiment_name}' on: {device}")
+    if lr_schedule == "warmup_cosine":
+        print(f"  LR schedule: warmup_cosine (peak={lr:.1e}, warmup_steps={warmup_steps}, "
+              f"min_ratio={lr_min_ratio})")
+    else:
+        print(f"  LR schedule: plateau (lr={lr:.1e}, patience={lr_patience}, factor={lr_factor})")
     if loss_weighting is not None:
         print(f"  Loss weighting: {loss_weighting} (atm_alpha={atm_alpha}, vol_alpha={vol_alpha})")
 
@@ -150,8 +202,8 @@ def train_transformer(
 
     model = model.to(device)
 
-    # Re-seed the head's final bias to match the transformed target range
-    # so the network isn't forced to climb out of zero.
+    # Re-seed the head's final bias to match the transformed target range so
+    # the network isn't forced to climb out of zero.
     #   raw        → ~$15 (mean option price)
     #   log        → log1p(15) ≈ 2.77
     #   time_value → log1p(4) ≈ 1.61 (mean time value is much smaller than
@@ -165,16 +217,17 @@ def train_transformer(
         pass
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=lr_factor, patience=lr_patience,
+    batches_per_epoch = max(1, len(train_loader))
+    total_steps = batches_per_epoch * max_epochs
+    scheduler, step_per_batch = _build_scheduler(
+        optimizer, lr_schedule,
+        total_steps=total_steps, warmup_steps=warmup_steps,
+        lr_min_ratio=lr_min_ratio,
+        lr_patience=lr_patience, lr_factor=lr_factor,
     )
 
     def _transform_label(y, inputs):
-        """Transform raw-price labels to the training target space.
-
-        Contract block is 8-wide; K and moneyness live at CONTRACT_K_IDX /
-        CONTRACT_MONEYNESS_IDX. Slice notation keeps the (batch, 1) shape.
-        """
+        """Transform raw-price labels to the training target space."""
         if target_mode == "raw":
             return y
         if target_mode == "log":
@@ -211,7 +264,10 @@ def train_transformer(
         w = weights.view(-1, 1)
         return (w * (preds - labels) ** 2).sum() / w.sum()
 
-    history = {"train_loss": [], "val_loss": [], "lr": []}
+    history = {
+        "train_loss": [], "val_loss": [],
+        "val_mae_dollars": [], "lr": [], "grad_norm": [],
+    }
     best_val_loss = float("inf")
     best_state = None
     no_improve = 0
@@ -220,6 +276,7 @@ def train_transformer(
         # ── Train ──
         model.train()
         train_loss_sum = 0.0
+        grad_norm_sum = 0.0
         n_batches = 0
         for inputs, labels in train_loader:
             inputs = inputs.to(device)
@@ -232,17 +289,23 @@ def train_transformer(
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            if step_per_batch:
+                scheduler.step()
 
             train_loss_sum += loss.item()
+            grad_norm_sum += float(grad_norm)
             n_batches += 1
 
         avg_train_loss = train_loss_sum / max(n_batches, 1)
+        avg_grad_norm = grad_norm_sum / max(n_batches, 1)
 
         # ── Validate ──
         model.eval()
         val_loss_sum = 0.0
+        val_mae_sum = 0.0
+        val_samples = 0
         n_val_batches = 0
         with torch.no_grad():
             for inputs, labels in val_loader:
@@ -255,19 +318,29 @@ def train_transformer(
                 val_loss_sum += loss.item()
                 n_val_batches += 1
 
+                # Raw-dollar MAE — the metric we actually evaluate on test.
+                raw_preds = _invert_preds(preds, inputs, target_mode)
+                val_mae_sum += (raw_preds - labels_raw).abs().sum().item()
+                val_samples += labels_raw.shape[0]
+
         avg_val_loss = val_loss_sum / max(n_val_batches, 1)
+        avg_val_mae_dollars = val_mae_sum / max(val_samples, 1)
         current_lr = optimizer.param_groups[0]["lr"]
 
         history["train_loss"].append(avg_train_loss)
         history["val_loss"].append(avg_val_loss)
+        history["val_mae_dollars"].append(avg_val_mae_dollars)
         history["lr"].append(current_lr)
+        history["grad_norm"].append(avg_grad_norm)
 
-        scheduler.step(avg_val_loss)
+        if not step_per_batch:
+            scheduler.step(avg_val_loss)
 
         if epoch % log_every == 0 or epoch == 1:
             print(f"  Epoch {epoch:>3d}/{max_epochs}  |  "
                   f"Train: {avg_train_loss:.6f}  |  Val: {avg_val_loss:.6f}  |  "
-                  f"LR: {current_lr:.2e}")
+                  f"Val-MAE$: {avg_val_mae_dollars:.3f}  |  "
+                  f"LR: {current_lr:.2e}  |  GradN: {avg_grad_norm:.2f}")
 
         # Early stopping
         if avg_val_loss < best_val_loss:
@@ -281,20 +354,17 @@ def train_transformer(
                 print(f"  Early stopping at epoch {epoch} (no improvement for {patience} epochs)")
                 break
 
-    # Restore best model
     if best_state is not None:
         model.load_state_dict(best_state)
     model = model.cpu()
 
-    # Tag the model so predict_transformer knows which inverse transform to
-    # apply at inference. target_mode is the Run 3+ attribute; log_target is
-    # kept for backward compat with Run 2 checkpoints.
     model.target_mode = target_mode
     model.log_target = (target_mode == "log")
 
-    # Save final
     torch.save(model.state_dict(), os.path.join(checkpoint_dir, "final_model.pt"))
-    print(f"  Best val loss: {best_val_loss:.6f}  |  Saved to {checkpoint_dir}")
+    print(f"  Best val loss: {best_val_loss:.6f}  |  "
+          f"Best val-MAE$ (at best-loss epoch): {history['val_mae_dollars'][np.argmin(history['val_loss'])]:.3f}  |  "
+          f"Saved to {checkpoint_dir}")
 
     return model, history
 
@@ -336,8 +406,9 @@ def run_ablation(ablation_id, train_dataset, seq_len=30, device=None, **kwargs):
     ----------
     ablation_id : str
         One of A1-A6 (feature/context ablations) or B1-B6 (Step 3 architecture
-        sweep). B5 is the LR-schedule ablation and picks up slower decay
-        defaults here rather than a model-level change.
+        sweep). B5 is the LR-schedule ablation and defaults to linear-warmup
+        + cosine decay here (Vaswani 2017 recipe); the baseline stays on
+        ReduceLROnPlateau so B5 gives a clean A/B on whether warmup matters.
     train_dataset : Dataset
     seq_len : int
     device : torch.device or None
@@ -358,12 +429,8 @@ def run_ablation(ablation_id, train_dataset, seq_len=30, device=None, **kwargs):
         override_seq_len = {"A3": 20, "A4": 60}.get(ablation_id, seq_len)
         model = build_ablation_transformer(ablation_id, seq_len=override_seq_len)
 
-    # B5 is the LR-schedule ablation: double ReduceLROnPlateau patience and
-    # halve the decay factor so the model spends longer at each LR before
-    # stepping down. Caller can still override either via kwargs.
     if ablation_id == "B5":
-        kwargs.setdefault("lr_patience", 10)
-        kwargs.setdefault("lr_factor", 0.25)
+        kwargs.setdefault("lr_schedule", "warmup_cosine")
 
     return train_transformer(
         model, train_dataset,
