@@ -42,7 +42,11 @@ def download_yfinance(start="2010-01-01", end="2024-01-01", data_dir=None):
     results = {}
     for name, ticker in tickers.items():
         print(f"Downloading {name} ({ticker})...")
-        df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+        # auto_adjust=False so SPY 'Close' is the actual market close on each
+        # date, not retroactively reduced for later dividends. The Kaggle
+        # options dataset is quoted against unadjusted SPY; mismatching the
+        # two introduces a systematic ~$20 spot offset that dominates BS MAE.
+        df = yf.download(ticker, start=start, end=end, auto_adjust=False, progress=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(1)
         path = os.path.join(data_dir, f"{name.lower()}.csv")
