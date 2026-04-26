@@ -260,8 +260,10 @@ def evaluate_all_models(opts_test, models_dict, sequences=None, master_df=None,
             regime_rows.append(m)
     regime_df = pd.DataFrame(regime_rows)
     if len(regime_df):
-        print("\n=== By Volatility Regime ===")
-        print(regime_df.pivot(index="Model", columns="Regime", values="MAE").to_string())
+        print("\n=== By Volatility Regime — MAE ($) ===")
+        print(regime_df.pivot(index="Model", columns="Regime", values="MAE").round(3).to_string())
+        print("\n=== By Volatility Regime — MAPE (%) ===")
+        print(regime_df.pivot(index="Model", columns="Regime", values="MAPE").round(2).to_string())
         regime_df.to_csv(os.path.join(tables_dir, "regime_metrics.csv"), index=False)
 
     # ── Breakdown by moneyness ──
@@ -280,8 +282,10 @@ def evaluate_all_models(opts_test, models_dict, sequences=None, master_df=None,
             money_rows.append(m)
     money_df = pd.DataFrame(money_rows)
     if len(money_df):
-        print("\n=== By Moneyness ===")
-        print(money_df.pivot(index="Model", columns="Moneyness", values="MAE").to_string())
+        print("\n=== By Moneyness — MAE ($) ===")
+        print(money_df.pivot(index="Model", columns="Moneyness", values="MAE").round(3).to_string())
+        print("\n=== By Moneyness — MAPE (%) ===")
+        print(money_df.pivot(index="Model", columns="Moneyness", values="MAPE").round(2).to_string())
         money_df.to_csv(os.path.join(tables_dir, "moneyness_metrics.csv"), index=False)
 
     # ── Breakdown by time to expiry ──
@@ -299,8 +303,10 @@ def evaluate_all_models(opts_test, models_dict, sequences=None, master_df=None,
             expiry_rows.append(m)
     expiry_df = pd.DataFrame(expiry_rows)
     if len(expiry_df):
-        print("\n=== By Time to Expiry ===")
-        print(expiry_df.pivot(index="Model", columns="Expiry", values="MAE").to_string())
+        print("\n=== By Time to Expiry — MAE ($) ===")
+        print(expiry_df.pivot(index="Model", columns="Expiry", values="MAE").round(3).to_string())
+        print("\n=== By Time to Expiry — MAPE (%) ===")
+        print(expiry_df.pivot(index="Model", columns="Expiry", values="MAPE").round(2).to_string())
         expiry_df.to_csv(os.path.join(tables_dir, "expiry_metrics.csv"), index=False)
 
     # ── Comparison bar chart ──
