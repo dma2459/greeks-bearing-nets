@@ -1,277 +1,153 @@
-% =============================================================================
-% Greeks Bearing Nets — CSCI 1470 Final Project Poster
-% Beamerposter, 48" x 36" landscape (4:3)
-% Build: pdflatex poster.tex
-% =============================================================================
-\documentclass[final,t]{beamer}
-\usepackage[size=custom,width=121.92,height=91.44,scale=1.15]{beamerposter}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{lmodern}
+\documentclass[final]{beamer}
+
+% 4:3 Aspect Ratio Custom Size (120cm x 90cm)
+% Increased scale to 1.45 to enlarge font and fill whitespace
+\usepackage[orientation=landscape,size=custom,width=120,height=90,scale=1.45]{beamerposter}
+
+% Enforce IEEEtran style: Serif fonts and black/white colors
+\usefonttheme{serif}
+\setbeamercolor{background canvas}{bg=white}
+\setbeamercolor{text}{fg=black}
+\setbeamercolor{headline}{bg=white,fg=black}
+\setbeamercolor{itemize item}{fg=black}
+\setbeamercolor{itemize subitem}{fg=black}
+\setbeamercolor{caption name}{fg=black}
+
+% Remove default navigation symbols
+\setbeamertemplate{navigation symbols}{}
+
 \usepackage{graphicx}
 \usepackage{booktabs}
-\usepackage{array}
-\usepackage{amsmath,amssymb}
-\usepackage{xcolor}
-\usepackage{tikz}
-
-\graphicspath{{../results/figures/}{./figures/}}
-
-% --- Brown-ish palette ---
-\definecolor{brunopri}{RGB}{79,17,17}     % deep crimson
-\definecolor{brunosec}{RGB}{200,140,40}   % warm gold accent
-\definecolor{brunobg}{RGB}{248,244,236}   % warm off-white
-\definecolor{rulegray}{RGB}{120,120,120}
-
-\setbeamercolor{background canvas}{bg=brunobg}
-\setbeamercolor{block title}{fg=white,bg=brunopri}
-\setbeamercolor{block body}{fg=black,bg=white}
-\setbeamerfont{block title}{size=\large,series=\bfseries}
-\setbeamertemplate{navigation symbols}{}
-\setbeamertemplate{itemize items}{\color{brunopri}\textbf{--}}
-
-% Tighter blocks
-\setbeamertemplate{block begin}{
-  \begin{beamercolorbox}[wd=\textwidth,ht=2.4ex,dp=0.6ex,leftskip=0.6em,rightskip=0.6em]{block title}
-    \insertblocktitle
-  \end{beamercolorbox}
-  \begin{beamercolorbox}[wd=\textwidth,leftskip=0.7em,rightskip=0.7em,vmode]{block body}
-    \vspace{0.3em}
-}
-\setbeamertemplate{block end}{\vspace{0.3em}\end{beamercolorbox}\vspace{0.6em}}
-
-% =============================================================================
-\title{\Huge\textbf{Greeks Bearing Nets}\\[0.25em]
-       \Large Synthetic Markets and Transformer Pricing for SPY Options}
-\author{CSCI 1470 -- Deep Learning Final Project}
-\institute{Brown University \quad \textbar \quad Spring 2026}
-\date{}
+\usepackage{amsmath}
+\usepackage{microtype} % Improves text justification
 
 \begin{document}
-\begin{frame}[t]
+\begin{frame}[fragile]{}
 
-% --- Header bar ---
+% ========================================
+% TITLE BLOCK
+% ========================================
 \begin{center}
-\begin{tikzpicture}
-  \fill[brunopri] (0,0) rectangle (\paperwidth,3.2);
-  \node[white] at (\paperwidth/2, 2.1) {\fontsize{60}{72}\selectfont\textbf{Greeks Bearing Nets}};
-  \node[brunosec] at (\paperwidth/2, 0.85) {\fontsize{28}{34}\selectfont\textbf{Synthetic Markets and Transformer Pricing for SPY Options}};
-\end{tikzpicture}\\[0.2em]
-{\large CSCI 1470 -- Deep Learning Final Project \quad\textbullet\quad Brown University \quad\textbullet\quad Spring 2026}
+    {\Huge \textbf{A Deep Learning Approach to End of Day Options Pricing}}\\[0.8em]
+    {\Large Daniel White, Riley Rosenberger, Adyant Ranjan, Daniel Ma}\\[0.4em]
+    {\large \textit{Brown University, CS1470 Deep Learning}}
 \end{center}
-\vspace{0.4em}
+\vspace{0.2cm}
+\hrule height 2pt
+\vspace{1cm}
 
-% =============================================================================
-\begin{columns}[t,totalwidth=\paperwidth]
+% ========================================
+% THREE-COLUMN LAYOUT
+% ========================================
+\begin{columns}[t]
 
-% =============================================================================
-% COLUMN 1
-% =============================================================================
-\begin{column}{0.32\paperwidth}
+    % ----------------------------------------
+    % COLUMN 1: Intro & Methodology Start
+    % ----------------------------------------
+    \begin{column}{.31\linewidth}
 
-\begin{block}{Motivation}
-The Black-Scholes (BS) formula gives the textbook price of a European option,
-but its assumption of constant volatility and Gaussian returns is famously
-wrong: real markets exhibit a \emph{volatility smile}, fat tails, and
-volatility clustering. We ask whether a deep model trained on
-\textbf{synthetic market histories} can price options more faithfully than
-BS, particularly in the regions where BS misprices most.
-\vspace{0.2em}
-\begin{itemize}
-  \item \textbf{Goal.} Beat Black-Scholes on out-of-sample SPY option prices.
-  \item \textbf{Idea.} Use a TimeGAN to generate realistic SPY price paths,
-        then train a Transformer pricer on options simulated through those
-        paths.
-  \item \textbf{Test.} Compare against BS, a Heston-trained baseline, and
-        a real-market regression on a held-out 2023--2024 sample.
-\end{itemize}
-\end{block}
+        {\Large \textbf{I. INTRODUCTION}}
+        \vspace{0.5em}
 
-\begin{block}{Data}
-\begin{itemize}
-  \item \textbf{Underlying.} SPY daily OHLCV, 2010--2024 (\(\sim\)3{,}500 days).
-  \item \textbf{Options.} EOD SPY chain, 2023--2024 ($\sim$135K contracts after
-        cleaning), with strike, expiry, mid-quote, IV, and BS Greeks.
-  \item \textbf{Macro / market state.} VIX, 10Y yield, realized vol, term
-        spread, returns at multiple horizons -- 20 features per day.
-  \item \textbf{Sequences.} 30-day rolling windows of these 20 features feed
-        the price-history encoder.
-\end{itemize}
-\vspace{0.2em}
-\begin{center}
-\includegraphics[width=0.95\linewidth]{eda_correlation.png}\\[0.1em]
-{\small Feature correlation heatmap. VIX, realized vol, and short-horizon
-returns carry the strongest signal for option mispricing residuals.}
-\end{center}
-\end{block}
+        \textbf{A. The Fundamentals of Options}\\
+        An option is a financial derivative that gives the buyer the right, but not the obligation, to buy or sell an underlying asset at a specified "strike" price on a specific date. Our project focuses exclusively on \textit{European Call Options}. A call option gives the buyer the right to \textit{buy} the asset. The "European" designation means the option can \textit{only} be exercised exactly on its expiration date, unlike American options which can be exercised early. This constraint simplifies the boundaries of valuation, making them the standard benchmark for pricing theories.
+        \vspace{0.5em}
 
-\begin{block}{Black-Scholes Baseline}
-\[
-C_{\text{BS}} = S\,N(d_1) - K e^{-rT} N(d_2), \qquad
-d_1 = \tfrac{\ln(S/K)+(r+\tfrac12\sigma^2)T}{\sigma\sqrt T}.
-\]
-We use \emph{realized} 20-day volatility for $\sigma$, the 10Y yield for $r$,
-and contract-level $S$, $K$, $T$. This is the same input set our networks see,
-so the comparison isolates the model, not the data.
-\end{block}
+        \textbf{B. The Importance of Pricing}\\
+        Calculating the exact fair value of these contracts at the End-of-Day (EOD) close is critical to global finance. Market makers rely on fair-value models to quote bid-ask spreads safely. Furthermore, clearinghouses (like the OCC) and mutual funds rely on hyper-accurate EOD valuations to calculate overnight margin requirements and Net Asset Values (NAV). Mispricing risk at the EOD can lead to catastrophic, systemic financial contagion.
+        \vspace{0.5em}
 
-\end{column}
+        \textbf{C. The Black-Scholes Baseline}\\
+        For fifty years, the standard has been the Black-Scholes formula (1973). However, it relies on flawed assumptions: that asset returns follow a log-normal distribution and that volatility is constant. In reality, markets exhibit "fat tails" (frequent extreme crashes) and volatility clustering. We hypothesize that deep neural networks can bypass these parametric constraints, learning the true, non-linear pricing function directly from historical data.
+        \vspace{1.2em}
 
-% =============================================================================
-% COLUMN 2
-% =============================================================================
-\begin{column}{0.34\paperwidth}
+        {\Large \textbf{II. METHODOLOGY}}
+        \vspace{0.5em}
 
-\begin{block}{TimeGAN: Learning the SPY Distribution}
-TimeGAN (Yoon et al., 2019) couples an autoencoder with an adversarial game in
-latent space, plus a supervisor that enforces step-to-step temporal
-consistency. Five GRU sub-networks are trained in three phases:
-\vspace{0.2em}
-\begin{enumerate}
-  \item \textbf{Phase 1.} Autoencoder pretraining: $\min \|R(E(x))-x\|^2$.
-  \item \textbf{Phase 2.} Supervisor pretraining: predict next latent state.
-  \item \textbf{Phase 3.} Joint adversarial training of $G$, $D$, $S$, with
-        $E$/$R$ anchored on a reconstruction loss to keep the latent space
-        well-defined.
-\end{enumerate}
+        \textbf{A. TimeGAN Data Synthesis}\\
+        Training on a single historical timeline causes severe overfitting. We address this with a Time-series GAN (TimeGAN), which jointly trains a generator, discriminator, and an embedding network to preserve the temporal dynamics of real market data. Each synthetic sample consists of a 60-day window of per-step features: log-return ($r_t$), rolling 20-day realized volatility ($\sigma_t$), time-to-expiry ($\tau$), and strike-normalized spot price ($S_t/K$). These features are drawn from the same distribution as real equity data, ensuring the generated paths exhibit the volatility clustering and fat tails observed in practice.
+        \vspace{0.5em}
 
-\textbf{Two fixes that mattered most.}
-\begin{itemize}
-  \item Dropping the final \texttt{Sigmoid} from $R$ -- the data is
-        StandardScaler-normalized, so a $[0,1]$ output crushed every synthetic
-        return positive and inflated GAN labels $4\times$.
-  \item \texttt{BCEWithLogitsLoss} on linear $D$ logits -- the old
-        \texttt{Sigmoid + BCE} combo saturated and triggered the runaway
-        $G$-loss seen on Run 2.
-\end{itemize}
+        \textbf{B. Feature Engineering and Input Structure}\\
+        Each training sample is structured as a sequence of length 60 fed into the Transformer encoder. At each step $t_i$, the input vector contains: log-return, realized volatility, moneyness ($S_{t_i}/K$), and time-to-expiry ($\tau_i = T - t_i$). The sequence is aligned so the final step always corresponds to the option's valuation date, giving the model the correct spot price $S_T$ and $\tau = 0$ at the moment of pricing.
 
-\begin{center}
-\includegraphics[width=0.95\linewidth]{gan_distribution.png}\\[0.1em]
-{\small Real vs.\ synthetic 1-day log-returns. The GAN matches the variance,
-the heavy tails, and the slight negative skew characteristic of equity
-indices -- the structure BS explicitly throws away.}
-\end{center}
-\end{block}
+    \end{column}
 
-\begin{block}{Transformer Pricer}
-A single architecture, three label sources. Inputs:
-\begin{itemize}
-  \item A \textbf{30-day price-history sequence} (20 features) encoded by a
-        4-layer Transformer encoder ($d_\text{model}{=}128$, 8 heads).
-  \item An \textbf{8-feature contract block} ($S$, $K$, $T$, $r$, IV, $K/S$,
-        $\log T$, BS-price input) projected and fused with the encoded
-        history.
-\end{itemize}
-The head predicts $\log(\text{time value} + 1)$ -- training in log-space
-killed the dead-ReLU collapse we saw on Run 2 and removed the need for an
-output clamp.
-\vspace{0.2em}
-\begin{center}\small
-\begin{tabular}{ll}
-\toprule
-\textbf{Variant} & \textbf{Training labels} \\
-\midrule
-A. Heston       & MC pricing under a fitted Heston SV model \\
-B. GAN (RN)     & MC pricing on 2{,}000 GAN paths, \emph{risk-neutral drift} \\
-C. Mixed + ATM  & 50/50 Heston + GAN-RN, ATM-weighted sampling \\
-\bottomrule
-\end{tabular}
-\end{center}
-\textbf{Why the RN correction matters.} TimeGAN learns the physical measure
-$P$ of SPY, but options are priced under the risk-neutral measure $Q$. We
-apply a per-step Girsanov shift $r/252 - \tfrac12\sigma_t^2 - \mu_{P,t}$ when
-generating GAN-based labels; without it the GAN's positive equity drift bled
-straight into mispriced calls.
-\end{block}
+    % ----------------------------------------
+    % COLUMN 2: Methodology C, Results A & B
+    % ----------------------------------------
+    \begin{column}{.31\linewidth}
 
-\end{column}
+        \textbf{C. Architecture and Output Formulation}\\
+        The encoder consists of 4 multi-head self-attention layers (8 heads each), enabling the model to dynamically attend to distant volatility regimes within each 60-day window. This is something a feedforward network cannot do. A linear readout head projects the final-step encoder representation to a scalar. To enforce the no-arbitrage lower bound and prevent negative prices, the model predicts the option's \textit{time value} in log space. The final price is recovered as:
+        \begin{equation*}
+            \text{Price} = \text{expm1}(\hat{y}) + \max(0,\, S_T - K)
+        \end{equation*}
+        where $\hat{y}$ is the raw scalar output and $\max(0, S_T - K)$ is the intrinsic value floor.
+        \vspace{1.0em}
 
-% =============================================================================
-% COLUMN 3
-% =============================================================================
-\begin{column}{0.32\paperwidth}
+        {\Large \textbf{III. RESULTS}}
+        \vspace{0.5em}
 
-\begin{block}{Results: 2023--2024 SPY Options}
-\textbf{C beats Black-Scholes overall} on both MAE and MSE; A is essentially
-tied with BS on MAE while halving MSE on long-dated tails; B underperforms.
-\vspace{0.2em}
-\begin{center}\footnotesize
-\setlength{\tabcolsep}{4pt}
-\renewcommand{\arraystretch}{1.05}
-\begin{tabular}{lcccc}
-\toprule
-\textbf{Model} & \textbf{Overall} & \textbf{ITM} & \textbf{ATM} & \textbf{OTM} \\
-\midrule
-Black-Scholes        & 1.515         & 1.44          & \textbf{1.58} & 1.54 \\
-Transformer A (Heston)  & 1.552         & 1.24          & 2.10          & \textbf{1.17} \\
-Transformer B (GAN, RN) & 2.148         & 1.62          & 2.75          & 2.06 \\
-Transformer C (Mixed)   & \textbf{1.510}$^\star$ & \textbf{1.18} & 1.92 & 1.39 \\
-\bottomrule
-\end{tabular}\\[0.2em]
-{\small MAE in dollars on held-out 2023--2024 contracts. \textbf{Bold} =
-best per column; $\star$ = best overall.}
-\end{center}
+        \textbf{A. Generative Data Validation (TimeGAN)}\\
+        The TimeGAN reproduces the non-Gaussian character of real log-returns. Both distributions display excess kurtosis well above the Gaussian baseline of 3.0 (real: 7.75, synthetic: 5.14), confirming the generator captures fat-tail behavior. The moderate kurtosis gap suggests the GAN slightly under-generates extreme events, but shape alignment is sufficient for robust training diversity.
+        \vspace{0.3em}
 
-\vspace{0.4em}
-\textbf{Where each model wins.}
-\begin{center}\footnotesize
-\setlength{\tabcolsep}{4pt}
-\begin{tabular}{lcccc}
-\toprule
-\textbf{Slice} & \textbf{BS} & \textbf{A} & \textbf{B} & \textbf{C} \\
-\midrule
-Low VIX ($<$15)   & \textbf{0.81} & 1.49 & 1.78 & 1.59 \\
-Med VIX (15--25)  & 1.24          & \textbf{1.04} & 1.80 & 1.15 \\
-High VIX ($>$25)  & 2.21          & 2.49 & 2.89 & \textbf{2.13} \\
-\midrule
-Short expiry      & \textbf{1.09} & 1.27 & 1.89 & 1.26 \\
-Medium expiry     & 1.82          & 1.86 & 2.17 & \textbf{1.76} \\
-Long expiry       & 2.84          & 2.21 & 3.28 & \textbf{2.14} \\
-\bottomrule
-\end{tabular}
-\end{center}
-\vspace{0.2em}
-{\small BS owns the easy regime (low vol, short expiry, ATM). The mixed
-Transformer C dominates exactly the regions where BS structurally fails:
-\textbf{long-dated, ITM, and high-volatility} contracts -- the smile.}
-\end{block}
+        \begin{figure}[h]
+            \centering
+            \includegraphics[width=0.55\linewidth]{gan_distribution.png}
+            \caption{Real vs.\ synthetic log-return distributions. Both exhibit heavy tails far exceeding Gaussian kurtosis.}
+        \end{figure}
+        \vspace{0.3em}
 
-\begin{block}{What we learned}
-\begin{itemize}
-  \item \textbf{Mixing real-physics (Heston) and learned-distribution (GAN)
-        labels works.} Each label source is a flawed teacher; together they
-        regularize each other.
-  \item \textbf{Smile capture is the win.} BS prices ATM near-perfectly --
-        the model edge comes entirely from tails and tenor, not from the
-        ``flat'' part of the surface.
-  \item \textbf{The risk-neutral drift correction is non-optional.} Without
-        it, the GAN-trained Transformer prices calls too high by construction.
-  \item \textbf{Pure GAN labels (B) are not enough.} The GAN captures
-        marginals well but its 60-day rollouts are noisier than Heston's
-        analytic dynamics, so unmixed GAN labels add variance without
-        structure.
-\end{itemize}
-\end{block}
+        \textbf{B. Feature Learning (Transformer)}\\
+        The correlation matrix reveals strong inter-dependencies among volatility features (rv\_5d, rv\_21d, gk\_vol, vix, rv\_iv\_spread), which self-attention can jointly exploit. Notably, vix\_slope and vix\_6m\_slope are negatively correlated with realized volatility, capturing the term-structure of fear. These rich cross-feature signals—unavailable to Black-Scholes—are a key source of the Transformer's competitive performance.
+        \vspace{0.3em}
 
-\begin{block}{Limitations \& Future Work}
-\begin{itemize}
-  \item \textbf{MAPE is misleading on OTM.} OTM denominators are
-        \$0.30--\$2, so a single dollar of error reads as 100\%+. We report
-        MAE/MSE bucket-wise and quote MAPE only on ITM (where it is
-        meaningful: \(\sim\)4--6\%).
-  \item Single underlying (SPY) and a 2-year test window. Extending to
-        multi-asset and to crisis years (2008, 2020) is the natural next test.
-  \item No Greeks-level evaluation yet -- delta/vega-aware loss is the
-        clearest path to using these models for hedging, not just pricing.
-\end{itemize}
-\end{block}
+        \begin{figure}[h]
+            \centering
+            \includegraphics[width=0.55\linewidth]{eda_correlation.png}
+            \caption{Feature correlation matrix across the 20 input signals used by the Transformer encoder.}
+        \end{figure}
 
-\begin{block}{}
-\centering\small
-Code \& data: \texttt{github.com/dma2459/greeks-bearing-nets}
-\end{block}
+    \end{column}
 
-\end{column}
+    % ----------------------------------------
+    % COLUMN 3: Results C & Discussion
+    % ----------------------------------------
+    \begin{column}{.31\linewidth}
+
+        \textbf{C. Overall Comparative Performance}\\
+        We evaluated three Transformer variants against Black-Scholes across moneyness buckets. The mixed-label model (C), trained on a 50/50 blend of Heston and risk-neutral GAN-priced contracts, achieves the strongest overall MAE and the best ITM performance, while the Heston-only model (A) wins OTM. Black-Scholes still dominates the ATM bucket, where its log-normal assumption is closest to reality and global MSE training tends to smooth over the sharp Gamma-driven valuation spikes that the Transformers must learn from data.
+        \vspace{0.5em}
+
+        \begin{center}
+        \begin{tabular}{lcccc}
+            \toprule
+            \textbf{Model} & \textbf{Overall} & \textbf{ITM} & \textbf{ATM} & \textbf{OTM} \\
+            \midrule
+            Black-Scholes  & 1.515 & 1.44 & \textbf{1.58} & 1.54 \\
+            Transformer A (Heston) & 1.552 & 1.24 & 2.10 & \textbf{1.17} \\
+            Transformer B (GAN)    & 2.148 & 1.62 & 2.75 & 2.06 \\
+            Transformer C (Mixed)  & \textbf{1.510} & \textbf{1.18} & 1.92 & 1.39 \\
+            \bottomrule
+        \end{tabular}
+        \end{center}
+        \vspace{0.3em}
+        {\small \textit{Table 1: Validation MAE (\$) by moneyness bucket. Bold indicates best performance per column.}}
+        \vspace{0.8em}
+
+        {\Large \textbf{IV. DISCUSSION}}
+        \vspace{0.5em}
+
+        \textbf{A. Numerical Stability}\\
+        A critical design challenge was preventing the network from producing arbitrage-violating negative prices. Early experiments with direct price regression suffered from exploding gradients when spot prices moved far from the strike. Predicting the \textit{time value} in log space—and recovering the full price via $\text{expm1}(\hat{y}) + \max(0, S_T - K)$—resolved this entirely. The intrinsic value floor acts as a hard constraint, and the log transformation compresses the output range, making training significantly more stable and convergent.
+        \vspace{0.8em}
+
+        \textbf{B. EOD Scope and Intraday Limitations}\\
+        Our model is fundamentally designed around the structure of EOD data: a fixed 60-day lookback window with one observation per trading day. This makes it well-suited for overnight margin and NAV calculations, but not for intraday pricing. Intraday option values are driven by tick-level microstructure—order flow imbalances, bid-ask dynamics, and real-time volatility surfaces—that daily features cannot capture. Extending this approach to intraday applications would require a complete re-architecture around higher-frequency inputs and much shorter sequence horizons.
+
+    \end{column}
 
 \end{columns}
 \end{frame}
