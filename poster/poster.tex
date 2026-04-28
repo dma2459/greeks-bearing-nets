@@ -90,18 +90,18 @@
         \vspace{0.5em}
 
         \textbf{A. Generative Data Validation (TimeGAN)}\\
-        The TimeGAN reproduces the non-Gaussian character of real log-returns. Both distributions display excess kurtosis well above the Gaussian baseline of 3.0 (real: 7.66, synthetic: 5.14), confirming the generator captures fat-tail behavior. The moderate kurtosis gap suggests the GAN slightly under-generates extreme events, but shape alignment is sufficient for robust training diversity.
+        The TimeGAN reproduces the non-Gaussian character of real SPY log-returns. Both distributions display excess kurtosis well above the Gaussian baseline of 3.0 (real: 7.66, synthetic: 5.14), confirming the generator captures fat-tail behavior. The synthetic peak is slightly sharper and the far-tail mass slightly thinner—the GAN modestly under-generates extreme events—but the overall shape alignment is close enough that paths sampled from the generator make a faithful proxy for the true return distribution at training time.
         \vspace{0.3em}
 
         \begin{figure}[h]
             \centering
             \includegraphics[width=0.95\linewidth]{gan_distribution.png}
-            \caption{Real vs.\ synthetic log-return distributions. Both exhibit heavy tails far exceeding Gaussian kurtosis.}
+            \caption{Real vs.\ synthetic 1-day log-return distributions. Both exhibit heavy tails far exceeding Gaussian kurtosis (3.0).}
         \end{figure}
         \vspace{0.3em}
 
         \textbf{B. Pricing Accuracy vs.\ Black-Scholes}\\
-        Across the held-out test set, the mixed-label Transformer (C) achieves the lowest overall MAE and narrowly outperforms the Black-Scholes baseline. The pure-Heston variant (A) is essentially tied with BS in aggregate, while the pure-GAN variant (B) lags both. The takeaway is that synthetic GAN paths alone are not enough; combining them with Heston-priced contracts gives the network both distributional realism and the no-arbitrage structure that drives reliable pricing.
+        On the held-out test set, the mixed-label Transformer (C) achieves the lowest overall MAE (\$1.51) and is the only neural model to beat the Black-Scholes baseline (\$1.52). The Heston-trained Transformer (A) is essentially tied with BS at \$1.55, while the pure-GAN variant (B) lags noticeably at \$2.15. The pattern is structural: GAN paths alone are too noisy to teach reliable pricing, but pairing them with Heston-priced contracts gives the network both distributional realism and the no-arbitrage rigor a closed-form formula already provides.
 
     \end{column}
 
@@ -113,12 +113,12 @@
         \begin{figure}[h]
             \centering
             \includegraphics[width=0.95\linewidth]{model_comparison_mae.png}
-            \caption{Overall test-set MAE (\$) for the four pricing models. Transformer C (mixed Heston + risk-neutral GAN labels) narrowly beats Black-Scholes; the pure-GAN variant (B) underperforms.}
+            \caption{Overall test-set MAE (\$) for the four pricing models. Transformer C (mixed Heston + risk-neutral GAN labels) narrowly beats Black-Scholes; the pure-GAN variant (B) trails by roughly \$0.6.}
         \end{figure}
         \vspace{0.3em}
 
         \textbf{C. Per-Bucket Performance}\\
-        The aggregate gap is small but the per-bucket structure is informative: Transformer C wins ITM and overall, Transformer A wins OTM, and Black-Scholes retains ATM, where its log-normal assumption is closest to reality.
+        The aggregate gap is small, but the moneyness breakdown is informative: each model dominates a different slice of the volatility smile. Transformer C wins ITM, Transformer A wins OTM, and Black-Scholes retains ATM, where its log-normal assumption is closest to reality.
         \vspace{0.5em}
 
         \begin{center}
