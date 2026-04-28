@@ -100,8 +100,8 @@
         \end{figure}
         \vspace{0.3em}
 
-        \textbf{B. Feature Learning (Transformer)}\\
-        The correlation matrix reveals strong inter-dependencies among volatility features (rv\_5d, rv\_21d, gk\_vol, vix, rv\_iv\_spread), which self-attention can jointly exploit. Notably, vix\_slope and vix\_6m\_slope are negatively correlated with realized volatility, capturing the term-structure of fear. These rich cross-feature signals—unavailable to Black-Scholes—are a key source of the Transformer's competitive performance.
+        \textbf{B. Transformer Training Dynamics}\\
+        Both GAN-influenced variants converge to validation MSE near 0.15 over 60 epochs. The pure-GAN model (B) fits its own smooth, GAN-priced labels more tightly and reaches lower in-domain loss, but the mixed-label model (C) generalizes better on real held-out options (Table 1). The mixed objective is harder to fit but learns the broader pricing function that matters at test time—a clean illustration of why in-domain validation loss is a misleading proxy for downstream accuracy when training labels and test labels are not drawn from the same distribution.
 
     \end{column}
 
@@ -112,13 +112,13 @@
 
         \begin{figure}[h]
             \centering
-            \includegraphics[width=0.95\linewidth]{eda_correlation.png}
-            \caption{Feature correlation matrix across the 20 input signals used by the Transformer encoder.}
+            \includegraphics[width=0.95\linewidth]{transformer_training.png}
+            \caption{Validation MSE during transformer training. B reaches lower in-domain loss against its own GAN-priced labels; C's mixed objective is noisier in-domain but generalizes better on real test options.}
         \end{figure}
         \vspace{0.3em}
 
         \textbf{C. Overall Comparative Performance}\\
-        We evaluated three Transformer variants against Black-Scholes across moneyness buckets. The mixed-label model (C), trained on a 50/50 blend of Heston and risk-neutral GAN-priced contracts, achieves the strongest overall MAE and the best ITM performance, while the Heston-only model (A) wins OTM. Black-Scholes still dominates the ATM bucket, where its log-normal assumption is closest to reality and global MSE training tends to smooth over the sharp Gamma-driven valuation spikes that the Transformers must learn from data.
+        Transformer C edges out Black-Scholes overall (MAE 1.510 vs.\ 1.515) and wins ITM; Transformer A wins OTM; BS retains ATM, where its log-normal assumption is closest to reality.
         \vspace{0.5em}
 
         \begin{center}
