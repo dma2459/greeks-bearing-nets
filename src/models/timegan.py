@@ -124,15 +124,23 @@ class Discriminator(nn.Module):
     Outputs raw logits (no sigmoid) — use BCEWithLogitsLoss. The previous
     Sigmoid + BCELoss combo was prone to saturation, which is why the Phase 3
     curve showed D loss collapsing near zero while G loss ballooned to 6+.
+
+    v2: extra hidden FC + dropout. The shallow head (1 hidden layer, 64→1)
+    saturated quickly — the Generator could fool it on coarse moments while
+    still missing finer joint structure (vol clustering, cross-feature
+    correlations). A two-layer head with dropout makes D harder to fool and
+    forces G toward more realistic samples.
     """
 
-    def __init__(self, hidden_dim=64):
+    def __init__(self, hidden_dim=96, dropout=0.2):
         super().__init__()
         self.gru1 = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
         self.gru2 = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
         self.fc1 = nn.Linear(hidden_dim, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 1)
         self.leaky = nn.LeakyReLU(0.2)
-        self.fc2 = nn.Linear(64, 1)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, h):
         """
@@ -148,8 +156,10 @@ class Discriminator(nn.Module):
         o, _ = self.gru1(h)
         _, h_last = self.gru2(o)  # h_last: (1, batch, hidden_dim)
         h_last = h_last.squeeze(0)  # (batch, hidden_dim)
-        logits = self.fc2(self.leaky(self.fc1(h_last)))
-        return logits
+        x = self.leaky(self.fc1(h_last))
+        x = self.dropout(x)
+        x = self.leaky(self.fc2(x))
+        return self.fc3(x)
 
 
 class TimeGAN(nn.Module):
@@ -157,9 +167,14 @@ class TimeGAN(nn.Module):
     Container module holding all five TimeGAN sub-networks.
 
     Provides convenience methods for generation and saving/loading.
+
+    v2 default hidden_dim is 96 (was 64). Real SPY market state has more
+    structure than a 64-unit GRU comfortably represents — bumping capacity
+    helped the Discriminator distinguish subtle joint structure that the
+    Generator was previously sneaking past it.
     """
 
-    def __init__(self, input_dim=20, hidden_dim=64):
+    def __init__(self, input_dim=20, hidden_dim=96):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim

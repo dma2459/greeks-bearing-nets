@@ -18,6 +18,39 @@ from src.models.timegan import TimeGAN
 from src.data.dataset import GANDataset
 
 
+def _vol_clustering_loss(x_real, x_fake, lr_idx=0, lags=(1, 2, 3)):
+    """
+    Penalize mismatch in |log_return| autocorrelation between real and fake.
+
+    Real markets exhibit strongly positive autocorrelation in absolute returns
+    (volatility clustering — calm days follow calm days, jumpy days follow
+    jumpy days). The base TimeGAN's per-timestep moment-matching does not
+    enforce this temporal structure, so generated paths often show |return|
+    series that are too IID. This term explicitly closes the gap at small lags.
+
+    Implementation: per-batch lag-k autocorrelation of |x[:, :, lr_idx]|,
+    averaged across batch elements; squared-error vs the same statistic on
+    real data; mean across the requested lags.
+    """
+    abs_real = x_real[:, :, lr_idx].abs()
+    abs_fake = x_fake[:, :, lr_idx].abs()
+
+    real_c = abs_real - abs_real.mean(dim=1, keepdim=True)
+    fake_c = abs_fake - abs_fake.mean(dim=1, keepdim=True)
+
+    var_real = real_c.var(dim=1, unbiased=False).mean() + 1e-8
+    var_fake = fake_c.var(dim=1, unbiased=False).mean() + 1e-8
+
+    losses = []
+    for lag in lags:
+        cov_real = (real_c[:, :-lag] * real_c[:, lag:]).mean()
+        cov_fake = (fake_c[:, :-lag] * fake_c[:, lag:]).mean()
+        ac_real = cov_real / var_real
+        ac_fake = cov_fake / var_fake
+        losses.append((ac_real - ac_fake) ** 2)
+    return sum(losses) / len(losses)
+
+
 def train_timegan(
     train_sequences,
     input_dim=20,
@@ -70,7 +103,10 @@ def train_timegan(
     print(f"Training on: {device}")
 
     if checkpoint_dir is None:
-        checkpoint_dir = os.path.join("checkpoints", "timegan")
+        # v2 default: bumped hidden_dim, deeper Discriminator, vol-clustering
+        # loss in Phase 3. Old v1 checkpoints in checkpoints/timegan are not
+        # state-dict compatible (sub-network shapes changed).
+        checkpoint_dir = os.path.join("checkpoints", "timegan_v2")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Model
@@ -92,7 +128,8 @@ def train_timegan(
         lr_d = lr * 0.5
 
     history = {"phase1_loss": [], "phase2_loss": [],
-               "phase3_d_loss": [], "phase3_g_loss": []}
+               "phase3_d_loss": [], "phase3_g_loss": [],
+               "phase3_vc_loss": []}
 
     # ─── Phase 1: Autoencoder pretraining ───
     print("\n" + "=" * 60)
@@ -180,6 +217,7 @@ def train_timegan(
     for epoch in range(1, phase3_epochs + 1):
         d_epoch_loss = 0.0
         g_epoch_loss = 0.0
+        vc_epoch_loss = 0.0
 
         for batch in loader:
             batch = batch.to(device)
@@ -221,12 +259,23 @@ def train_timegan(
                     + mse(x_fake.var(dim=0), batch.var(dim=0))
                 )
 
-                g_loss = g_loss_adv + 10.0 * g_loss_sup + g_loss_moments
+                # Vol-clustering loss: match |log_return| autocorrelation at
+                # short lags. Targets the financial property (absolute-return
+                # persistence) most relevant to option pricing — without it
+                # GAN paths look approximately IID and produce labels with
+                # too-narrow vol distributions.
+                g_loss_vc = _vol_clustering_loss(batch, x_fake, lr_idx=0)
+
+                g_loss = (g_loss_adv
+                          + 10.0 * g_loss_sup
+                          + g_loss_moments
+                          + 5.0 * g_loss_vc)
 
                 opt_g.zero_grad()
                 g_loss.backward()
                 opt_g.step()
                 g_epoch_loss += g_loss.item()
+                vc_epoch_loss += g_loss_vc.item()
 
             # --- Embedder/Recovery reconstruction anchor ---
             h_real = model.embedder(batch)
@@ -238,11 +287,14 @@ def train_timegan(
 
         avg_d = d_epoch_loss / len(loader)
         avg_g = g_epoch_loss / (len(loader) * g_steps_per_d)
+        avg_vc = vc_epoch_loss / (len(loader) * g_steps_per_d)
         history["phase3_d_loss"].append(avg_d)
         history["phase3_g_loss"].append(avg_g)
+        history["phase3_vc_loss"].append(avg_vc)
 
         if epoch % log_every == 0 or epoch == 1:
-            print(f"  Epoch {epoch:>4d}/{phase3_epochs}  |  D Loss: {avg_d:.4f}  |  G Loss: {avg_g:.4f}")
+            print(f"  Epoch {epoch:>4d}/{phase3_epochs}  |  D Loss: {avg_d:.4f}  |  "
+                  f"G Loss: {avg_g:.4f}  |  VC Loss: {avg_vc:.4f}")
 
         # Periodic checkpoint
         if epoch % 100 == 0:
