@@ -102,13 +102,6 @@
 
         \textbf{B. Feature Learning (Transformer)}\\
         The correlation matrix reveals strong inter-dependencies among volatility features (rv\_5d, rv\_21d, gk\_vol, vix, rv\_iv\_spread), which self-attention can jointly exploit. Notably, vix\_slope and vix\_6m\_slope are negatively correlated with realized volatility, capturing the term-structure of fear. These rich cross-feature signals—unavailable to Black-Scholes—are a key source of the Transformer's competitive performance.
-        \vspace{0.3em}
-
-        \begin{figure}[h]
-            \centering
-            \includegraphics[width=0.95\linewidth]{eda_correlation.png}
-            \caption{Feature correlation matrix across the 20 input signals used by the Transformer encoder.}
-        \end{figure}
 
     \end{column}
 
@@ -116,6 +109,13 @@
     % COLUMN 3: Results C & Discussion
     % ----------------------------------------
     \begin{column}{.31\linewidth}
+
+        \begin{figure}[h]
+            \centering
+            \includegraphics[width=0.95\linewidth]{eda_correlation.png}
+            \caption{Feature correlation matrix across the 20 input signals used by the Transformer encoder.}
+        \end{figure}
+        \vspace{0.3em}
 
         \textbf{C. Overall Comparative Performance}\\
         We evaluated three Transformer variants against Black-Scholes across moneyness buckets. The mixed-label model (C), trained on a 50/50 blend of Heston and risk-neutral GAN-priced contracts, achieves the strongest overall MAE and the best ITM performance, while the Heston-only model (A) wins OTM. Black-Scholes still dominates the ATM bucket, where its log-normal assumption is closest to reality and global MSE training tends to smooth over the sharp Gamma-driven valuation spikes that the Transformers must learn from data.
